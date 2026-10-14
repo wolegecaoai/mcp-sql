@@ -209,7 +209,7 @@ public sealed class StartupDiagnostics
             catch (Exception ex)
             {
                 stopwatch.Stop();
-                results.Add(new ConnectivityResult(name, false, $"类型不受支持：{ex.Message}", stopwatch.ElapsedMilliseconds));
+                results.Add(new ConnectivityResult(name, false, $"类型不受支持：{SecretRedactor.Redact(ex.Message)}", stopwatch.ElapsedMilliseconds));
                 continue;
             }
 

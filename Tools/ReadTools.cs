@@ -238,7 +238,7 @@ public class ReadTools
         [Description("最大返回行数，默认 100，上限 5000")] int maxRows = 100,
         [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
         [Description("响应格式：envelope（默认，含元数据与提示）/ compact（列名只出现一次，宽表可省约一半 token）/ rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope,
-        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用，可防 SQL 注入")] IEnumerable<SqlParameterInput>? parameters = null,
+        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用，可防 SQL 注入")] List<SqlParameterInput>? parameters = null,
         CancellationToken ct = default)
     {
         var limit = Math.Clamp(maxRows, 1, 5000);
@@ -355,26 +355,35 @@ public class ReadTools
     }
 
     [McpServerTool(Name = "table_exists", ReadOnly = true, Idempotent = true)]
-    [Description("判断指定表是否存在（按 schema.表名 或 表名 解析）。返回 database / schema / table / exists。")]
+    [Description("判断指定表是否存在（按 schema.表名 或 表名 解析）。返回 database / schema / table / exists；exists=true/false 为确定结论，exists=null 表示无法判定（原因见 error）。")]
     public static async Task<string> TableExistsAsync(
         DatabaseService databaseService,
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("表名，格式为 \"表名\" 或 \"schema.表名\"，例如 dbo.Users")] string table)
     {
+        // 未授权库别名 / 非法表名属于调用方错误，直接抛出（不吞成 exists 结论）
         var provider = databaseService.GetProvider(database);
         var (schema, tableName) = provider.SplitTableName(table);
 
-        // 复用 Provider 的列探查 SQL：返回 0 行即视为表不存在；探查本身抛错（如表名非法）同样判为不存在
+        // 复用 Provider 的列探查 SQL：返回 0 行 = 确定不存在；探查抛错（连接失败/超时等）= 无法判定，
+        // 以 exists=null + error 表达，避免把"连不上"误导成"表不存在"而触发错误的建表决策（H2）。
         var (sql, parameters) = provider.BuildDescribeColumnsQuery(schema, tableName);
-        bool exists;
+        bool? exists = null;
+        string? error = null;
         try
         {
             var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 1, parameters);
             exists = result.Rows.Count > 0;
         }
-        catch (McpException)
+        catch (OperationCanceledException)
         {
-            exists = false;
+            throw;
+        }
+        catch (McpException ex)
+        {
+            // 错误文案已在服务层脱敏；此处仅标记"无法判定"
+            exists = null;
+            error = ex.Message;
         }
 
         return JsonSerializer.Serialize(
@@ -383,7 +392,8 @@ public class ReadTools
                 ["database"] = database,
                 ["schema"] = schema,
                 ["table"] = tableName,
-                ["exists"] = exists
+                ["exists"] = exists,
+                ["error"] = error
             },
             DatabaseService.SerializerOptions);
     }

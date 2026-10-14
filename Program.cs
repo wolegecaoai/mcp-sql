@@ -54,28 +54,20 @@ static async Task RunHttpAsync(string[] args, string configDirectory)
     // http 模式日志沿用默认控制台输出（无 stdio 协议，stdout 不被协议占用）；不重复 AddConsole 避免日志翻倍
     var app = builder.Build();
 
-    // 鉴权中间件：本地白名单在远程场景下不再够用，http 必须靠 ApiKey 校验
+    // 鉴权中间件：仅保护 /mcp 端点（其余路径如健康检查保持可达，便于探活）；未配置 ApiKey 一律 401（fail-closed）
     var apiKey = options.ApiKey;
-    if (!string.IsNullOrWhiteSpace(apiKey))
+    app.Use(async (context, next) =>
     {
-        app.Use(async (context, next) =>
+        if (HttpApiKeyAuth.IsMcpPath(context.Request.Path) &&
+            !HttpApiKeyAuth.IsAuthorized(context.Request, apiKey))
         {
-            var auth = context.Request.Headers["Authorization"].ToString();
-            var authorized = (auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
-                              && string.Equals(auth["Bearer ".Length..].Trim(), apiKey, StringComparison.Ordinal))
-                             || context.Request.Headers["X-Api-Key"].ToString() == apiKey;
+            context.Response.StatusCode = 401;
+            await context.Response.WriteAsync("Unauthorized");
+            return;
+        }
 
-            if (authorized)
-            {
-                await next();
-            }
-            else
-            {
-                context.Response.StatusCode = 401;
-                await context.Response.WriteAsync("Unauthorized");
-            }
-        });
-    }
+        await next();
+    });
 
     await app.Services.GetRequiredService<StartupDiagnostics>().RunAsync();
     app.MapMcp("/mcp");
@@ -161,19 +153,39 @@ static bool IsValidConfigDirectory(string directory)
     }
 }
 
-/// <summary>解析传输方式：优先环境变量 SqlServer__Transport，其次 appsettings.json 的 SqlServer:Transport，默认 stdio。</summary>
+/// <summary>解析传输方式（白名单校验）：优先环境变量 SqlServer__Transport，其次 appsettings.json 的 SqlServer:Transport；无法识别时告警并回退 stdio。</summary>
 static string ResolveTransport(string configDirectory)
+{
+    var raw = ReadRawTransport(configDirectory);
+    var normalized = (raw ?? string.Empty).Trim().ToLowerInvariant();
+
+    if (normalized is "stdio" or "http")
+    {
+        return normalized;
+    }
+
+    // M2：无法识别的值不能静默回退——输出 stderr 告警，避免部署者误以为起了 HTTP
+    if (!string.IsNullOrEmpty(normalized))
+    {
+        Console.Error.WriteLine($"[警告] 配置 SqlServer:Transport=\"{raw}\" 无法识别，已回退为 stdio（仅支持 stdio / http）。");
+    }
+
+    return "stdio";
+}
+
+/// <summary>读取未校验的传输方式原始值：优先环境变量 SqlServer__Transport，其次 appsettings.json 的 SqlServer:Transport；缺省返回 null。</summary>
+static string? ReadRawTransport(string configDirectory)
 {
     var env = Environment.GetEnvironmentVariable("SqlServer__Transport");
     if (!string.IsNullOrWhiteSpace(env))
     {
-        return env!;
+        return env;
     }
 
     var path = Path.Combine(configDirectory, "appsettings.json");
     if (!File.Exists(path))
     {
-        return "stdio";
+        return null;
     }
 
     try
@@ -183,13 +195,13 @@ static string ResolveTransport(string configDirectory)
             sqlServer.TryGetProperty("Transport", out var transportValue) &&
             transportValue.ValueKind == JsonValueKind.String)
         {
-            return transportValue.GetString() ?? "stdio";
+            return transportValue.GetString();
         }
     }
     catch
     {
-        // 解析失败时回退默认，不阻断启动
+        // 解析失败时交由上层走默认值，不阻断启动
     }
 
-    return "stdio";
+    return null;
 }

@@ -10,7 +10,9 @@
 # 说明：
 #   * 配置挂载到 /app/appsettings.json —— 程序以 CWD（/app）为配置目录，挂载即生效；
 #   * 真实 appsettings.json 由 .dockerignore 排除，**不会**被打进镜像；
-#   * 连接宿主机的数据库时，Linux 下用 --network host（或 127.0.0.1 需改为 host.docker.internal）。
+#   * 连接宿主机的数据库时，Linux 下用 --network host（或 127.0.0.1 需改为 host.docker.internal）；
+#   * 运行时镜像用 aspnet:8.0（含 ASP.NET Core 共享框架）：本项目自支持 HTTP 传输起，
+#     产物同时依赖 Microsoft.NETCore.App 与 Microsoft.AspNetCore.App，故不能再用精简的 runtime:8.0。
 
 FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
 WORKDIR /src
@@ -27,7 +29,7 @@ COPY appsettings.example.json ./
 
 RUN dotnet publish SqlServerMcp.csproj -c Release -o /app/publish --no-restore
 
-FROM mcr.microsoft.com/dotnet/runtime:8.0 AS runtime
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS runtime
 WORKDIR /app
 
 COPY --from=build /app/publish ./

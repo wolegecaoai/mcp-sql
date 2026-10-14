@@ -30,7 +30,7 @@ public class WriteTools
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("要执行的 INSERT/UPDATE/DELETE 语句（仅单条）")] string sql,
         [Description("是否确认提交。false=演练模式（回滚）；true=真正提交")] bool confirm = false,
-        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用，可防 SQL 注入")] IEnumerable<SqlParameterInput>? parameters = null,
+        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用，可防 SQL 注入")] List<SqlParameterInput>? parameters = null,
         CancellationToken ct = default)
     {
         const string tool = "execute_non_query";
@@ -90,7 +90,7 @@ public class WriteTools
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("要执行的 DDL 语句（仅单条）")] string sql,
         [Description("是否确认提交。false=演练模式（回滚）；true=真正提交")] bool confirm = false,
-        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用")] IEnumerable<SqlParameterInput>? parameters = null,
+        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用")] List<SqlParameterInput>? parameters = null,
         CancellationToken ct = default)
     {
         const string tool = "execute_ddl";

@@ -13,7 +13,7 @@ public static class SecretRedactor
     /// 值部分取到分号 / 引号 / 行尾为止。
     /// </summary>
     private static readonly Regex PasswordRegex = new(
-        @"(?i)(?<![A-Za-z0-9_])(?:password|pwd|passwd)\s*=\s*[^;""'\r\n]+",
+        @"(?i)(?<![A-Za-z0-9_])(password|pwd|passwd)\s*=\s*[^;""'\r\n]+",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
     /// <summary>对输入脱敏；空输入原样返回。</summary>

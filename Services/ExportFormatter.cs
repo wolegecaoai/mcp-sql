@@ -184,16 +184,28 @@ public static class ExportFormatter
             {
                 builder.Append("<c r=\"").Append(reference).Append("\"/>");
             }
+            else if (value is bool flag)
+            {
+                // bool 用布尔单元格（t="b"），避免把 "True" 当数值写坏文件
+                builder.Append("<c r=\"").Append(reference).Append("\" t=\"b\"><v>").Append(flag ? 1 : 0).Append("</v></c>");
+            }
             else if (value is string text)
             {
-                // 与 CSV 一致的公式注入防护：开头为 = + - @（含不可见前缀）时加 ' 转义为文本
+                // 与 CSV 一致的公式注入防护：开头为 = + - @（含不可见前缀）时加 ' 转义为文本；并剔除 XML 非法字符
                 var safe = SanitizeFormulaInjection(text);
                 builder.Append("<c r=\"").Append(reference).Append("\" t=\"inlineStr\"><is><t xml:space=\"preserve\">")
                     .Append(SafeXml(safe)).Append("</t></is></c>");
             }
+            else if (TryNumericText(value, out var numeric))
+            {
+                // 仅真正的数值走 <v>（无引号、不变量格式）；NaN/Infinity 与非数值类型回落为字符串单元格
+                builder.Append("<c r=\"").Append(reference).Append("\"><v>").Append(numeric).Append("</v></c>");
+            }
             else
             {
-                builder.Append("<c r=\"").Append(reference).Append("\"><v>").Append(SafeXml(FormatValue(value))).Append("</v></c>");
+                var asText = SanitizeFormulaInjection(value.ToString() ?? string.Empty);
+                builder.Append("<c r=\"").Append(reference).Append("\" t=\"inlineStr\"><is><t xml:space=\"preserve\">")
+                    .Append(SafeXml(asText)).Append("</t></is></c>");
             }
 
             column++;
@@ -201,6 +213,26 @@ public static class ExportFormatter
 
         builder.Append("</row>");
         return builder.ToString();
+    }
+
+    /// <summary>仅当值为实数类型且可安全表示为不变体数字文本时返回 true（NaN/Infinity 除外，回落为字符串单元格）。</summary>
+    private static bool TryNumericText(object value, out string text)
+    {
+        switch (value)
+        {
+            case sbyte v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case byte v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case short v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case ushort v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case int v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case uint v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case long v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case ulong v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            case float v when !float.IsInfinity(v) && !float.IsNaN(v): text = v.ToString("R", CultureInfo.InvariantCulture); return true;
+            case double v when !double.IsInfinity(v) && !double.IsNaN(v): text = v.ToString("R", CultureInfo.InvariantCulture); return true;
+            case decimal v: text = v.ToString(CultureInfo.InvariantCulture); return true;
+            default: text = string.Empty; return false;
+        }
     }
 
     private static string ColumnLetter(int index)
@@ -216,6 +248,67 @@ public static class ExportFormatter
         return letter;
     }
 
-    private static string SafeXml(string text) =>
-        text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;");
+    /// <summary>转义 XML 特殊字符，并剔除 XML 1.0 非法字符（控制字符、非字符、未配对代理项），避免 Excel 报“文件损坏”。</summary>
+    private static string SafeXml(string text)
+    {
+        var cleaned = StripIllegalXmlChars(text);
+        return cleaned
+            .Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+            .Replace("\"", "&quot;").Replace("'", "&apos;");
+    }
+
+    /// <summary>
+    /// 剔除 XML 1.0 不允许的字符：0x00–0x1F 中除 \t \n \r 外的控制字符、U+FFFE/U+FFFF，
+    /// 以及未配对的 UTF-16 代理项（替换为 U+FFFD）。
+    /// </summary>
+    private static string StripIllegalXmlChars(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return text;
+        }
+
+        var builder = new StringBuilder(text.Length);
+        for (var i = 0; i < text.Length; i++)
+        {
+            var c = text[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 < text.Length && char.IsLowSurrogate(text[i + 1]))
+                {
+                    builder.Append(c).Append(text[i + 1]);
+                    i++;
+                }
+                else
+                {
+                    builder.Append('\uFFFD');
+                }
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                builder.Append('\uFFFD');
+            }
+            else if (!IsIllegalXmlChar(c))
+            {
+                builder.Append(c);
+            }
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool IsIllegalXmlChar(char c)
+    {
+        if (c is '\t' or '\n' or '\r')
+        {
+            return false;
+        }
+
+        if (c < '\u0020')
+        {
+            return true;
+        }
+
+        return c is '\uFFFE' or '\uFFFF';
+    }
 }

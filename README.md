@@ -51,6 +51,9 @@ dotnet publish -c Release -o publish
   "SqlServer": {
     "CommandTimeoutSeconds": 30,
     "AllowWrite": true,
+    "Transport": "stdio",
+    "HttpPort": 5000,
+    "ApiKey": "",
     "AuditRetentionDays": 30,
     "StartupConnectivityCheck": false,
     "DangerousKeywords": ["DROP DATABASE", "CREATE DATABASE", "..."],
@@ -74,6 +77,9 @@ dotnet publish -c Release -o publish
 | `Type`（条目内） | 数据库类型：`sqlserver` / `mysql` / `postgresql` / `sqlite`。**缺省为 `sqlserver`**，未填写该字段的旧配置继续按 SQL Server 处理 |
 | `CommandTimeoutSeconds` | SQL 命令超时（秒），默认 30 |
 | `AllowWrite` | 写操作总开关。设为 `false` 时 `execute_non_query`/`execute_ddl` 直接拒绝 |
+| `Transport` | 传输方式：`stdio`（默认，本机单客户端）/ `http`（Streamable HTTP，支持远程/多客户端）。无法识别的值会告警并回退 stdio |
+| `HttpPort` | `Transport=http` 时的监听端口（默认 5000），监听 `0.0.0.0`，MCP 端点为 `/mcp` |
+| `ApiKey` | `Transport=http` 的鉴权密钥；客户端须带 `Authorization: Bearer <ApiKey>` 或 `X-Api-Key` 请求头。**为空时 http 模式对所有 `/mcp` 请求返回 401（fail-closed）**；请置于反向代理/TLS 之后使用 |
 | `MaxResponseChars` | 单次查询响应的字符预算（近似值），默认 60000（≈15000 tokens）。**行数上限之外的第二道闸**：宽表或含大文本的行即便行数不多也可能打爆模型上下文。超预算时按行截断，并在响应信封里置 `truncated`/`notice`；设为 `0` 表示不限制 |
 | `AuditRetentionDays` | 审计日志保留天数（默认 30，`0` 表示不清理）。启动时清理更早的日文件；**当日文件与目录内其他文件永不删除** |
 | `StartupConnectivityCheck` | 启动时是否对所有授权库做连通性预检（默认 `false`）。开启会增加启动耗时；失败**仅告警不阻断**启动 |
@@ -308,8 +314,10 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 | `list_views` | 只读 | 视图列表（含定义前 500 字符） |
 | `list_stored_procedures` | 只读 | 存储过程/函数列表（含定义前 500 字符；SQLite 无存储过程返回空列表） |
 | `test_connection` | 只读 | 连通性检查：Provider 类型、服务器版本、当前库名、连接耗时（毫秒） |
-| `execute_query` | 只读 | 执行单条 SELECT/WITH 查询，返回 JSON 数组，行数受上限约束 |
-| `export_query_result` | 只读 | 执行只读查询并导出为 csv / markdown / json（CSV 含公式注入防护） |
+| `health_check` | 只读 | 并行探测所有已授权库（单库最多 5 秒），返回每库连通状态、服务器版本与耗时 |
+| `table_exists` | 只读 | 判断表是否存在（schema.表名 或 表名）。`exists=true/false` 为确定结论，`exists=null` 表示无法判定（原因见 `error`） |
+| `execute_query` | 只读 | 执行单条 SELECT/WITH 查询，返回 JSON 数组，行数受上限约束；支持 `parameters` 参数化（`@name` 占位符，四类库通用） |
+| `export_query_result` | 只读 | 执行只读查询并导出为 csv / markdown / json / xlsx（CSV/XLSX 含公式注入防护；xlsx 返回 base64，保存为 .xlsx 打开） |
 | `query_audit_log` | 只读 | 查询本服务的审计日志（写操作/守卫拒绝/执行失败），可按 UTC 日期、库、事件类型、工具过滤，返回最新若干条 |
 | `list_databases`（可选参数） | 只读 | `include_server_info=true` 时逐库探测服务器版本与当前库名；默认输出已含 `ddl_rehearsal` 与 `supports_stored_procedures` |
 | `execute_non_query` | 写 | 执行单条 INSERT/UPDATE/DELETE，confirm 二次确认（四类数据库均支持） |
@@ -380,7 +388,9 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 │   ├── DatabaseService.cs         # 白名单解析、Provider 路由、通用执行、只读/写入守卫入口
 │   ├── SqlGuardService.cs         # 语句分类、单语句校验、黑名单、只读守卫、无 WHERE 识别
 │   ├── TableNameParser.cs         # 引号标识符感知的表名解析（四 Provider 共用）
-│   ├── ExportFormatter.cs         # CSV / Markdown / JSON 导出（含公式注入防护）
+│   ├── ExportFormatter.cs         # CSV / Markdown / JSON / XLSX 导出（公式注入防护 + XML 非法字符剔除）
+│   ├── SecretRedactor.cs          # 连接串密码脱敏（面向调用方的错误文案）
+│   ├── HttpApiKeyAuth.cs          # http 传输鉴权判定（仅 /mcp、空 ApiKey fail-closed）
 │   ├── AuditLogger.cs             # 审计日志：写入、查询、保留清理
 │   ├── StartupDiagnostics.cs      # 启动自检：配置校验 + 可选连通性预检（只告警不阻断）
 │   └── Providers/
@@ -389,7 +399,7 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 │       ├── PostgreSqlProvider.cs  # PostgreSQL（pg_catalog + information_schema）
 │       └── SqliteProvider.cs      # SQLite（sqlite_master + PRAGMA）
 ├── Tools/
-│   ├── ReadTools.cs             # 9 个只读工具（含 test_connection / export_query_result）
+│   ├── ReadTools.cs             # 11 个只读工具（含 test_connection / export_query_result / health_check / table_exists）
 │   ├── WriteTools.cs            # 2 个写工具（confirm 二次确认）
 │   └── AuditTools.cs            # query_audit_log（审计日志查询，不接受路径参数）
 ├── Dockerfile / .dockerignore   # 容器化（stdio 运行，配置与日志走挂载）

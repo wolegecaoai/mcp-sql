@@ -10,7 +10,7 @@
 dotnet build                              # 构建（无 .sln，根目录直接构建主项目）
 dotnet build -o bin-test                  # 构建到独立目录；被运行中实例锁住 bin/ 时用这个
 dotnet run --no-build                     # 运行；必须加 --no-build，避免构建输出污染 stdio 通道
-dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（333 项；集成测试被默认过滤器排除，见下）
+dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（361 项；集成测试被默认过滤器排除，见下）
 dotnet publish -c Release -o publish      # 发布快照；publish/ 不是热更新，改代码/配置后必须重新 publish
 ```
 
@@ -38,24 +38,26 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"   # 显式 
 无解决方案文件，两个 csproj 并存；主项目用 `<Compile Remove="tests\**\*.cs" />` 排除测试代码，根目录其余 `.cs` 都会编入主程序集。
 
 ```
-Program.cs                    # 入口：Generic Host + stdio 传输 + DI + WithTools 注册 + 启动自检调用；所有日志走 stderr
+Program.cs                    # 入口：按配置在 stdio（默认，Generic Host）/ http（WebApplication，Streamable HTTP）间切换；DI + WithTools 注册 + 启动自检调用；stdio 下所有日志走 stderr
 appsettings.example.json      # 可提交的配置模板（无真实凭据）；CI 与发布产物用它生成 appsettings.json
-Configuration/SqlServerOptions.cs  # 强类型配置，绑定 "SqlServer" 节
+Configuration/SqlServerOptions.cs  # 强类型配置，绑定 "SqlServer" 节（含 Transport / HttpPort / ApiKey）
 Services/
-  DatabaseService.cs          # 白名单解析、Provider 路由、通用执行；查询/写入的唯一受认可入口
+  DatabaseService.cs          # 白名单解析、Provider 路由、通用执行；查询/写入的唯一受认可入口（含参数化查询 ExecuteQueryCore/ExecuteWriteCore）
   SqlGuardService.cs          # SQL 安全守卫（见下「安全不变量」）
   DatabaseProviderFactory.cs  # 按 Type 字符串创建 Provider（大小写不敏感，缺省 sqlserver）
   TableNameParser.cs          # 引号标识符感知的表名解析（四 Provider 共用）
-  ExportFormatter.cs          # CSV / Markdown / JSON 导出纯函数（含公式注入防护）
+  ExportFormatter.cs          # CSV / Markdown / JSON / XLSX 导出纯函数（含公式注入防护 + XML 非法字符剔除）
   ResponseFormatter.cs        # 查询/目录类工具的统一输出（envelope / compact / rows 三形态）
   AuditLogger.cs              # 审计日志：写入 + 查询（QueryEntries）+ 保留清理（PruneOldFiles）
   StartupDiagnostics.cs       # 启动自检：配置校验（纯函数）+ 可选连通性预检，只告警不阻断
+  SecretRedactor.cs           # 连接串密码脱敏（Password/Pwd/Passwd），用于面向调用方的错误文案
+  HttpApiKeyAuth.cs           # http 传输鉴权判定（仅保护 /mcp，空 ApiKey fail-closed，定长时间比较）
   Providers/*.cs              # 四种数据库方言实现（唯一生成方言 SQL 的地方）
 Tools/
-  ReadTools.cs                # 9 个只读工具（7 探查/查询 + test_connection + export_query_result）
+  ReadTools.cs                # 11 个只读工具（7 探查/查询 + test_connection + export_query_result + health_check + table_exists）
   WriteTools.cs               # 2 个写工具：execute_non_query / execute_ddl
   AuditTools.cs               # query_audit_log（日志目录服务端固定，不接受路径参数）
-Dockerfile / .dockerignore    # 容器化：stdio 运行（docker run -i），配置与日志靠挂载
+Dockerfile / .dockerignore    # 容器化：stdio 运行（docker run -i）；运行时镜像为 aspnet:8.0（HTTP 传输需 ASP.NET Core 共享框架），配置与日志靠挂载
 docker-compose.test.yml       # 本地集成测试依赖（MySQL 8:3307 + PostgreSQL 16:5433）
 .github/workflows/ci.yml      # CI：构建 + 单元测试 + service 容器集成测试
 .github/workflows/release.yml # 发布：tag v* 触发四平台产物，打包前剔除真实配置
@@ -89,6 +91,8 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 - **`MaxRows` 已移除**：曾是无代码读取的死配置，已从 `SqlServerOptions` 删除（三期的 `ExampleConfigContractTests` 会断言示例模板里不再出现它）。行数由各工具的 `maxRows` 参数控制（默认 100，Clamp 到 1–5000）。
 - **测试默认排除集成测试**：测试 csproj 里设了 `<VSTestTestCaseFilter>Category!=Integration</VSTestTestCaseFilter>`，因此裸 `dotnet test` 永远零依赖可跑；CI 的集成 job 用显式 `--filter "Category=Integration"` **覆盖**该默认值（已验证覆盖生效）。改这个属性时务必确认两个方向都对。
 - **启动自检只告警不阻断**：`StartupDiagnostics.RunAsync` 在 `host.RunAsync()` 之前执行，配置问题只输出 stderr 警告。**不要**把它改成"有问题就退出"——stdio 服务启动即退出会让客户端侧完全拿不到诊断信息。配置文件的 `AddJsonFile` 是 `optional: true`，缺失时同样走警告路径而不是抛异常。
+- **传输方式 stdio / http 双路径**：`SqlServer:Transport`（stdio 默认 / http）决定启动 stdio（Generic Host，stdout 是协议通道）还是 http（`WebApplication` + `WithHttpTransport` + `MapMcp("/mcp")`）。http 模式唯一鉴权闸是 `HttpApiKeyAuth` 中间件——**仅保护 `/mcp`、未配置 `ApiKey` 一律 401（fail-closed）**；`Transport` 无法识别时 `ResolveTransport` 输出 stderr 告警并回退 stdio。**新增传输/中间件不得削弱该 fail-closed。**
+- **运行时需 ASP.NET Core 8.0**：自支持 http 传输起，产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`（`ModelContextProtocol.AspNetCore` + `<FrameworkReference Microsoft.AspNetCore.App />`）。Dockerfile 运行时镜像已用 `aspnet:8.0`；framework-dependent 发布物要求目标机装有 **.NET ASP.NET Core 8.0 运行时**（仅装 .NET 运行时会启动失败）。
 - **`out/` 已 gitignore**：RID 发布与 release 打包的临时目录，其中含 `appsettings.json` 副本（可能带真实凭据），禁止提交。
 - **`dotnet run` 与 `--no-build`**：本地手工测试时建议加 `--no-build`（避免构建输出污染 stdio）；作为 MCP 客户端配置时**不要**加（否则改代码后重启不会重编译）。
 - **`publish/` 是快照**：OpenCode 侧配置指向 `publish\SqlServerMcp.exe`，改代码或配置后必须重新 `dotnet publish -c Release -o publish` 才生效（CodeBuddy 侧是 `dotnet run`，重启自动编译）。
@@ -132,6 +136,39 @@ dotnet build -o bin-test     # 绕开被运行实例锁定的 bin/
 用 `Start-Process` 启动 `bin-test\SqlServerMcp.dll`（重定向 stdin/stdout/stderr），再用 `StreamWriter`（`UTF8Encoding($false)`，**逐行写入 + Flush + 每行间隔约 1 秒**）依次写入 `initialize` → `notifications/initialized` → `tools/call …`。
 
 要点：不要整体管道重定向 JSON 行（进程启动即读取，会丢消息）；解析输出用 `ConvertFrom-Json` 比正则可靠；验证拒绝类行为时**核对拒绝原因文本**，避免把"连接失败/其他规则拦截"误判成目标规则生效。
+
+## 代码审查（子代理调用规范）
+
+`code-reviewer` 是**全新上下文的子代理**，不继承本会话任何结论。它慢的根因不是模型，而是「让它自己找改动」+「不设调用/输出上限」+「把不确定的东西留给它猜」。同一提交（`9a6f87b`，10 文件 +670/−82）的实测对照：
+
+| 提示写法 | 工具调用 | 墙钟 | credits | 真实缺陷 |
+| --- | --- | --- | --- | --- |
+| 只给背景描述 + 要求逐项核验表（历史做法） | 27–36 | 127–149s | 3.6–4.3 | 能查到，但最慢 |
+| 给 diff 范围 + 文件锚点 + 限输出 | 17 | 126s | 2.1 | 全部命中 |
+| 再加「硬压到 ≤3 次调用 + 禁止自证」 | 3 | 47s | 0.7 | **漏掉 2 个真实缺陷，并出现误报** |
+| **必读清单 + ≤8 次预算 + 禁自证 + 喂入已知事实** | **8** | **36s** | **0.8** | 全部命中 |
+
+结论：**不要压调用次数，要消除"找文件"**。不确定性比工具调用更贵——限制过狠时它会用「需验证」把结论糊过去，并漏读关键小文件。
+
+调用时必须给足 5 项：
+
+1. **范围**：贴 `git show --stat <commit>` 输出，声明「只审这些文件，其余视为已审」；
+2. **第一步命令**：`git --no-pager show <commit> --format="" -- <文件列表>`（一次拿全量 diff，替代逐个读文件）；
+3. **必读清单**：小文件点名整读（如 `SecretRedactor.cs` 仅 29 行），大文件给**行号区间**；明确禁止全库搜索；
+4. **调用预算**：提示里写「≤8 次工具调用」，调用 `task` 时同时设 `max_turns`；并**禁止它运行 `dotnet`/脚本自证**——构建与测试由我先跑，把输出作为事实喂给它；
+5. **已核实事实与项目约定**：把我的验证结果与本文档相关约定一并给出（例如「目录/版本工具执行 Provider 生成的 SQL，允许直接调 `ExecuteQueryAsync`」），否则它会把既有设计报成问题；输出只留 Critical/Important，每条 `文件:行号` + 问题 + 为什么 + 最小改法，总长 ≤400 字，不要核验表与代码摘要。
+
+```
+只读审查提交 <commit>，不要修改任何文件。项目根：<路径>。
+预算：最多 8 次工具调用（用尽即输出结论）。
+第 1 次：git --no-pager show <commit> --format="" -- <文件列表>
+必读清单（按序读，不要自行搜索）：<小文件整读 / 大文件行号区间>
+禁止：全库搜索、通读未改动文件、运行任何验证命令或脚本。
+范围与已核实事实：<只审这 N 个文件；dotnet test X/Y 全绿；相关既有约定……不要报成问题>
+审查目标：<本次变更引入的能力，逐条问"与既有契约是否冲突、有无绕过口子">
+输出：只输出 Critical 与 Important，每条一行 `文件:行号` + 问题 + 为什么 + 最小改法（≤3 行）；
+没有写「无」；总长 ≤400 字；不要背景复述、代码摘要、核验表、Minor、可交付性结论。
+```
 
 ## 平台与仓库
 

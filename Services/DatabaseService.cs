@@ -307,8 +307,8 @@ public class DatabaseService
                 }
                 catch (Exception ex)
                 {
-                    // 未预期异常同样只影响该条目，否则「单库失败隔离」对异常类型不成立（I5）
-                    return (Database: name, Info: (ServerInfo?)null, Error: (string?)$"未预期的错误：{ex.Message}");
+                    // 未预期异常同样只影响该条目，否则「单库失败隔离」对异常类型不成立（I5）；错误文案脱敏（L3）
+                    return (Database: name, Info: (ServerInfo?)null, Error: (string?)$"未预期的错误：{SecretRedactor.Redact(ex.Message)}");
                 }
             })
             .ToList();
@@ -692,7 +692,27 @@ public class DatabaseService
             return;
         }
 
+        // L5：参数个数上限，避免把上千个参数直接丢给驱动（各驱动行为不一）
+        const int MaxParameterCount = 500;
+
+        // 同名参数后者覆盖前者：规避 SqlClient 对重复名的 ArgumentException，同时让四类库行为一致
+        var unique = new Dictionary<string, SqlParameterInput>(StringComparer.OrdinalIgnoreCase);
         foreach (var parameter in parameters)
+        {
+            if (string.IsNullOrWhiteSpace(parameter.Name))
+            {
+                throw new McpException("参数化查询失败：存在参数名为空的参数。");
+            }
+
+            unique[parameter.Name] = parameter;
+        }
+
+        if (unique.Count > MaxParameterCount)
+        {
+            throw new McpException($"参数化查询失败：参数个数（{unique.Count}）超过上限 {MaxParameterCount}。");
+        }
+
+        foreach (var parameter in unique.Values)
         {
             var dbParameter = command.CreateParameter();
             dbParameter.ParameterName = parameter.Name;
