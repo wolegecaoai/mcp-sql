@@ -27,6 +27,14 @@ public record QueryResult(
     public string ToJson() => JsonSerializer.Serialize(Rows, DatabaseService.SerializerOptions);
 }
 
+/// <summary>
+/// 参数化查询的输入参数（供工具层接收 JSON 数组，如 <c>[{"name":"age","value":30}]</c>）。
+/// 占位符统一用 <c>@name</c>（SQL Server / MySQL / PostgreSQL / SQLite 的 .NET 驱动均支持）。
+/// <see cref="Value"/> 在经 MCP SDK 反序列化后可能为 <see cref="System.Text.Json.JsonElement"/>，
+/// 由 <see cref="DatabaseService"/> 在绑定参数时归一化为 CLR 值。
+/// </summary>
+public sealed record SqlParameterInput(string Name, object? Value);
+
 /// <summary>数据库连通性与服务器信息（test_connection 与 list_databases 共用）。</summary>
 public sealed record ServerInfo(
     string Database,
@@ -206,6 +214,18 @@ public class DatabaseService
     }
 
     /// <summary>
+    /// 只读查询（参数化入口）：占位符 @name，四类库通用。守卫仍基于 SQL 模板文本，
+    /// 参数值不进入 SQL 文本，反而不易被注入绕过。offset 透传以支持分页续取。
+    /// </summary>
+    public async Task<QueryResult> ExecuteReadOnlyQueryAsync(
+        string database, string sql, int maxRows, IEnumerable<SqlParameterInput>? parameters,
+        string toolName = "execute_query", CancellationToken ct = default, int offset = 0)
+    {
+        AssertReadOnlyQuery(database, sql, toolName);
+        return await ExecuteQueryAsync(database, sql, maxRows, parameters, ct: ct, offset: offset);
+    }
+
+    /// <summary>
     /// 探测连通性与服务器信息（版本、当前库）——test_connection 与 list_databases 共用，
     /// 避免两处各写一遍版本探测。执行的是 Provider 自身生成的 SQL，无注入面。
     /// 失败抛已翻译的 <see cref="McpException"/>，由调用方决定整体失败还是逐库报告。
@@ -332,20 +352,30 @@ public class DatabaseService
                 }
             }
 
-            throw new McpException(provider.TranslateError(ex, database), ex);
+            // 翻译为中文后做密码脱敏，避免凭据随错误文案回显给调用方（4.6）
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
         }
     }
 
     /// <summary>
-    /// 执行查询并读取最多 maxRows 行。超出上限时截断（Truncated=true），避免大结果集打爆上下文。
-    /// 另有第二道闸：按字符预算（<see cref="SqlServerOptions.MaxResponseChars"/>）截断，
-    /// 因为宽表/含大文本的行即便行数不多也可能打爆上下文。
-    /// internal（I1）：查询类调用必须走 <see cref="ExecuteReadOnlyQueryAsync"/>（内含只读守卫），
-    /// 外部程序集无法绕过守卫直接调用本方法。测试通过 InternalsVisibleTo 访问。
+    /// 执行查询（参数化入口，接收 <see cref="SqlParameterInput"/>，占位符用 @name，四类库通用）。
+    /// 内部委托 <see cref="ExecuteQueryCore"/>，避免与方言 Provider 的内部 <see cref="DbParameter"/> 入口重复逻辑。
+    /// 注意：本重载的 parameters 无默认值，确保「省略 parameters」的调用（如 list_views）能唯一解析到 DbParameter 重载。
     /// </summary>
-    /// <param name="offset">跳过结果集的前 N 行（分页续取用；注意读取代价仍存在）。</param>
-    /// <param name="maxChars">字符预算覆盖值；≤0 表示使用配置默认。</param>
-    /// <param name="commandTimeoutSeconds">命令超时覆盖值；≤0 表示使用配置默认（批量探测用短超时）。</param>
+    internal async Task<QueryResult> ExecuteQueryAsync(
+        string database,
+        string sql,
+        int maxRows,
+        IEnumerable<SqlParameterInput>? parameters,
+        CancellationToken ct = default,
+        int offset = 0,
+        int maxChars = 0,
+        int commandTimeoutSeconds = 0)
+        => await ExecuteQueryCore(database, sql, maxRows, command => AddSqlParameters(command, parameters), ct, offset, maxChars, commandTimeoutSeconds);
+
+    /// <summary>
+    /// 执行查询（方言 Provider 内部入口，接收已构造的 <see cref="DbParameter"/>）。
+    /// </summary>
     internal async Task<QueryResult> ExecuteQueryAsync(
         string database,
         string sql,
@@ -355,6 +385,37 @@ public class DatabaseService
         int offset = 0,
         int maxChars = 0,
         int commandTimeoutSeconds = 0)
+        => await ExecuteQueryCore(database, sql, maxRows, command =>
+        {
+            if (parameters is not null)
+            {
+                foreach (var parameter in parameters)
+                {
+                    // DbParameter 实例只能隶属于一个 DbParameterCollection，
+                    // 这里复制后加入，允许调用方在多次查询间复用同一组参数对象。
+                    command.Parameters.Add(CopyParameter(command, parameter));
+                }
+            }
+        }, ct, offset, maxChars, commandTimeoutSeconds);
+
+    /// <summary>
+    /// 查询执行核心（两个参数化重载共用）：打开连接、绑定参数、读取最多 maxRows 行，
+    /// 超行数 / 字符预算截断，并对 Provider 返回的异常做中文翻译与密码脱敏（4.6）。
+    /// internal（I1）：查询类调用必须走 <see cref="ExecuteReadOnlyQueryAsync"/>（内含只读守卫），
+    /// 外部程序集无法绕过守卫直接调用本方法。测试通过 InternalsVisibleTo 访问。
+    /// </summary>
+    /// <param name="offset">跳过结果集的前 N 行（分页续取用；注意读取代价仍存在）。</param>
+    /// <param name="maxChars">字符预算覆盖值；≤0 表示使用配置默认。</param>
+    /// <param name="commandTimeoutSeconds">命令超时覆盖值；≤0 表示使用配置默认（批量探测用短超时）。</param>
+    private async Task<QueryResult> ExecuteQueryCore(
+        string database,
+        string sql,
+        int maxRows,
+        Action<DbCommand> bindParameters,
+        CancellationToken ct,
+        int offset,
+        int maxChars,
+        int commandTimeoutSeconds)
     {
         var provider = GetProvider(database);
         var connection = await OpenConnectionAsync(database, ct);
@@ -366,15 +427,7 @@ public class DatabaseService
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
         command.CommandTimeout = commandTimeout;
-        if (parameters is not null)
-        {
-            foreach (var parameter in parameters)
-            {
-                // DbParameter 实例只能隶属于一个 DbParameterCollection，
-                // 这里复制后加入，允许调用方在多次查询间复用同一组参数对象。
-                command.Parameters.Add(CopyParameter(command, parameter));
-            }
-        }
+        bindParameters(command);
 
         var rows = new List<Dictionary<string, object?>>();
         var truncated = false;
@@ -453,7 +506,8 @@ public class DatabaseService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            throw new McpException(provider.TranslateError(ex, database), ex);
+            // 翻译为中文后做密码脱敏，避免凭据随错误文案回显给调用方 / 审计日志（4.6）
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
         }
 
         return new QueryResult(rows, truncated, columnCount, names, skipped, truncatedBySize, offset);
@@ -467,10 +521,8 @@ public class DatabaseService
         JsonSerializer.Serialize(row, SerializerOptions).Length;
 
     /// <summary>
-    /// 在显式事务中执行写语句（INSERT/UPDATE/DELETE/DDL）。
-    /// commit=false 时执行后回滚（演练模式），commit=true 时提交。
-    /// 守卫下沉（I2）：单语句 / 黑名单 / 语句分类在此二次校验，作为工具层之外的结构性兜底——
-    /// 任何新的写入口即使忘记校验，也无法绕过安全机制。
+    /// 在显式事务中执行写语句（INSERT/UPDATE/DELETE/DDL）。占位符 @name，四类库通用。
+    /// 见 <see cref="ExecuteWriteCore"/> 的语义说明（含密码脱敏）。
     /// </summary>
     /// <param name="allowedTypes">允许执行的语句类型白名单（必填，避免漏传即放行——IM-2）。</param>
     public async Task<int> ExecuteInTransactionAsync(
@@ -478,7 +530,34 @@ public class DatabaseService
         string sql,
         bool commit,
         IReadOnlyCollection<SqlStatementType> allowedTypes,
+        IEnumerable<SqlParameterInput>? parameters,
         CancellationToken ct = default)
+        => await ExecuteWriteCore(database, sql, commit, allowedTypes, command => AddSqlParameters(command, parameters), ct);
+
+    /// <summary>
+    /// 在显式事务中执行写语句（方言 Provider 内部入口，无参数化）。
+    /// </summary>
+    public async Task<int> ExecuteInTransactionAsync(
+        string database,
+        string sql,
+        bool commit,
+        IReadOnlyCollection<SqlStatementType> allowedTypes,
+        CancellationToken ct = default)
+        => await ExecuteWriteCore(database, sql, commit, allowedTypes, _ => { }, ct);
+
+    /// <summary>
+    /// 写操作执行核心（两个重载共用）：commit=false 时执行后回滚（演练模式），commit=true 时提交。
+    /// 守卫下沉（I2）：单语句 / 黑名单 / 语句分类在此二次校验，作为工具层之外的结构性兜底——
+    /// 任何新的写入口即使忘记校验，也无法绕过安全机制。建连失败与所有异常均做密码脱敏（4.6）后留痕审计。
+    /// </summary>
+    /// <param name="allowedTypes">允许执行的语句类型白名单（必填，避免漏传即放行——IM-2）。</param>
+    private async Task<int> ExecuteWriteCore(
+        string database,
+        string sql,
+        bool commit,
+        IReadOnlyCollection<SqlStatementType> allowedTypes,
+        Action<DbCommand> bindParameters,
+        CancellationToken ct)
     {
         var provider = GetProvider(database);
 
@@ -505,8 +584,8 @@ public class DatabaseService
         }
         catch (McpException ex)
         {
-            // 建连失败同属写失败，需留痕审计（MI-1）
-            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", ex.Message, sql);
+            // 建连失败同属写失败，需留痕审计（MI-1）；错误文案脱敏
+            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
             throw;
         }
 
@@ -519,6 +598,7 @@ public class DatabaseService
                 await using var autoCommitCommand = connection.CreateCommand();
                 autoCommitCommand.CommandText = sql;
                 autoCommitCommand.CommandTimeout = Math.Max(1, _options.CommandTimeoutSeconds);
+                bindParameters(autoCommitCommand);
                 var autoCommitAffected = await autoCommitCommand.ExecuteNonQueryAsync(ct);
 
                 _logger.LogInformation(
@@ -529,8 +609,8 @@ public class DatabaseService
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
-                _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", ex.Message, sql);
-                throw new McpException(provider.TranslateError(ex, database), ex);
+                _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
+                throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
             }
         }
 
@@ -542,8 +622,8 @@ public class DatabaseService
         }
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
-            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", ex.Message, sql);
-            throw new McpException(provider.TranslateError(ex, database), ex);
+            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
         }
 
         await using var __ = transaction;
@@ -553,6 +633,7 @@ public class DatabaseService
             command.Transaction = transaction;
             command.CommandText = sql;
             command.CommandTimeout = Math.Max(1, _options.CommandTimeoutSeconds);
+            bindParameters(command);
 
             var affected = await command.ExecuteNonQueryAsync(ct);
 
@@ -584,8 +665,8 @@ public class DatabaseService
                 // 回滚失败时保留原始异常即可
             }
 
-            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", ex.Message, sql);
-            throw new McpException(provider.TranslateError(ex, database), ex);
+            _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
         }
     }
 
@@ -599,6 +680,48 @@ public class DatabaseService
         copy.Value = source.Value ?? DBNull.Value;
         return copy;
     }
+
+    /// <summary>
+    /// 把 <see cref="SqlParameterInput"/> 列表绑定到命令（按 @name 占位符）。
+    /// 值经 <see cref="ToDbValue"/> 归一化，确保经 MCP SDK 反序列化得到的 <see cref="System.Text.Json.JsonElement"/> 也正确落地。
+    /// </summary>
+    private static void AddSqlParameters(DbCommand command, IEnumerable<SqlParameterInput>? parameters)
+    {
+        if (parameters is null)
+        {
+            return;
+        }
+
+        foreach (var parameter in parameters)
+        {
+            var dbParameter = command.CreateParameter();
+            dbParameter.ParameterName = parameter.Name;
+            dbParameter.Value = ToDbValue(parameter.Value);
+            command.Parameters.Add(dbParameter);
+        }
+    }
+
+    /// <summary>
+    /// 将参数值归一化为 ADO.NET 可用的 CLR 值（JsonElement 由 <see cref="JeToDbValue"/> 具体化）。
+    /// </summary>
+    private static object? ToDbValue(object? value) => value switch
+    {
+        null => DBNull.Value,
+        JsonElement je => JeToDbValue(je),
+        _ => value
+    };
+
+    private static object? JeToDbValue(JsonElement je) => je.ValueKind switch
+    {
+        JsonValueKind.Null => DBNull.Value,
+        JsonValueKind.String => je.GetString(),
+        JsonValueKind.True => true,
+        JsonValueKind.False => false,
+        // 整数优先 long（避免小整数被当成 double 导致参数类型偏差），否则 double
+        JsonValueKind.Number => je.TryGetInt64(out var l) ? l : je.GetDouble(),
+        // 数组 / 对象作为 JSON 文本传入（调用方按需用 JSON 函数解析）
+        _ => je.GetRawText()
+    };
 
     private static object? NormalizeValue(object value) => value switch
     {

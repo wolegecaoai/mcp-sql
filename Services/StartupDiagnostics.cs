@@ -233,7 +233,8 @@ public sealed class StartupDiagnostics
                     OperationCanceledException when !ct.IsCancellationRequested =>
                         $"连接超时（超过 {timeoutSeconds} 秒）",
                     OperationCanceledException => "预检已被取消",
-                    _ => provider.TranslateError(ex, name)
+                    // 建连失败的错误文案做密码脱敏，避免凭据随诊断信息回显（4.6）
+                    _ => SecretRedactor.Redact(provider.TranslateError(ex, name))
                 };
 
                 results.Add(new ConnectivityResult(name, false, error, stopwatch.ElapsedMilliseconds));

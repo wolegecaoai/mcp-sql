@@ -238,11 +238,12 @@ public class ReadTools
         [Description("最大返回行数，默认 100，上限 5000")] int maxRows = 100,
         [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
         [Description("响应格式：envelope（默认，含元数据与提示）/ compact（列名只出现一次，宽表可省约一半 token）/ rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope,
+        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用，可防 SQL 注入")] IEnumerable<SqlParameterInput>? parameters = null,
         CancellationToken ct = default)
     {
         var limit = Math.Clamp(maxRows, 1, 5000);
         var result = await ExecuteGuardedReadAsync(
-            databaseService, auditLogger, database, "execute_query", sql, limit, Math.Max(0, offset), ct);
+            databaseService, auditLogger, database, "execute_query", sql, limit, Math.Max(0, offset), ct, parameters);
 
         return ResponseFormatter.Format(result, database, "execute_query", responseFormat, limit);
     }
@@ -271,20 +272,21 @@ public class ReadTools
     }
 
     [McpServerTool(Name = "export_query_result", ReadOnly = true, Idempotent = true)]
-    [Description("执行只读 SELECT 查询并导出为 csv / markdown / json。csv 保持机器可读纯净（不附加提示），json 返回含截断信息的信封，markdown 会在末尾附提示。")]
+    [Description("执行只读 SELECT 查询并导出为 csv / markdown / json / xlsx。csv 保持机器可读纯净（不附加提示），json 返回含截断信息的信封，markdown 会在末尾附提示；xlsx 返回 base64 字符串（保存为 .xlsx 打开）。")]
     public static async Task<string> ExportQueryResultAsync(
         DatabaseService databaseService,
         AuditLogger auditLogger,
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("要执行的 SELECT 语句（仅单条）")] string sql,
-        [Description("导出格式：csv（默认）/ markdown / json")] string format = "csv",
+        [Description("导出格式：csv（默认）/ markdown / json / xlsx")] string format = "csv",
         [Description("最大导出行数，默认 100，上限 5000")] int maxRows = 100,
         [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("可选参数化查询参数（JSON 数组，如 [{\"name\":\"age\",\"value\":30}]）；占位符用 @name，四类库通用")] IEnumerable<SqlParameterInput>? parameters = null,
         CancellationToken ct = default)
     {
         var limit = Math.Clamp(maxRows, 1, 5000);
         var result = await ExecuteGuardedReadAsync(
-            databaseService, auditLogger, database, "export_query_result", sql, limit, Math.Max(0, offset), ct);
+            databaseService, auditLogger, database, "export_query_result", sql, limit, Math.Max(0, offset), ct, parameters);
 
         var normalizedFormat = format.Trim().ToLowerInvariant();
         return normalizedFormat switch
@@ -292,7 +294,8 @@ public class ReadTools
             "csv" => ExportFormatter.ToCsv(result),
             "markdown" or "md" => ExportFormatter.ToMarkdown(result) + MarkdownNotice(result, limit),
             "json" => ResponseFormatter.Format(result, database, "export_query_result", ResponseFormatter.Envelope, limit),
-            _ => throw new McpException($"不支持的导出格式「{format}」。支持的格式：csv、markdown、json。")
+            "xlsx" => ExportFormatter.ToXlsx(result),
+            _ => throw new McpException($"不支持的导出格式「{format}」。支持的格式：csv、markdown、json、xlsx。")
         };
     }
 
@@ -314,7 +317,8 @@ public class ReadTools
         string sql,
         int limit,
         int offset,
-        CancellationToken ct)
+        CancellationToken ct,
+        IEnumerable<SqlParameterInput>? parameters = null)
     {
         try
         {
@@ -326,6 +330,61 @@ public class ReadTools
             throw;
         }
 
-        return await databaseService.ExecuteQueryAsync(database, sql, limit, ct: ct, offset: offset);
+        return await databaseService.ExecuteReadOnlyQueryAsync(database, sql, limit, parameters, ct: ct, offset: offset);
+    }
+
+    [McpServerTool(Name = "health_check", ReadOnly = true, Idempotent = true)]
+    [Description("对所有已授权数据库做连通性探测（并行、单库最多 5 秒），返回每库的连通状态、服务器版本与耗时（毫秒）。用于快速判断哪些库当前可达。")]
+    public static async Task<string> HealthCheckAsync(
+        DatabaseService databaseService,
+        CancellationToken ct = default)
+    {
+        var results = await databaseService.GetAllServerInfoAsync(5, ct);
+        var payload = results.Select(result => new Dictionary<string, object?>
+        {
+            ["database"] = result.Database,
+            ["connected"] = result.Info is not null,
+            ["server_version"] = result.Info?.ServerVersion,
+            ["latency_ms"] = result.Info?.LatencyMs,
+            ["error"] = result.Error
+        }).ToList();
+
+        return JsonSerializer.Serialize(
+            new Dictionary<string, object?> { ["count"] = payload.Count, ["databases"] = payload },
+            DatabaseService.SerializerOptions);
+    }
+
+    [McpServerTool(Name = "table_exists", ReadOnly = true, Idempotent = true)]
+    [Description("判断指定表是否存在（按 schema.表名 或 表名 解析）。返回 database / schema / table / exists。")]
+    public static async Task<string> TableExistsAsync(
+        DatabaseService databaseService,
+        [Description("目标数据库别名（必须是已授权库）")] string database,
+        [Description("表名，格式为 \"表名\" 或 \"schema.表名\"，例如 dbo.Users")] string table)
+    {
+        var provider = databaseService.GetProvider(database);
+        var (schema, tableName) = provider.SplitTableName(table);
+
+        // 复用 Provider 的列探查 SQL：返回 0 行即视为表不存在；探查本身抛错（如表名非法）同样判为不存在
+        var (sql, parameters) = provider.BuildDescribeColumnsQuery(schema, tableName);
+        bool exists;
+        try
+        {
+            var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 1, parameters);
+            exists = result.Rows.Count > 0;
+        }
+        catch (McpException)
+        {
+            exists = false;
+        }
+
+        return JsonSerializer.Serialize(
+            new Dictionary<string, object?>
+            {
+                ["database"] = database,
+                ["schema"] = schema,
+                ["table"] = tableName,
+                ["exists"] = exists
+            },
+            DatabaseService.SerializerOptions);
     }
 }

@@ -1,56 +1,31 @@
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using ModelContextProtocol;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Services;
 using SqlServerMcp.Tools;
+using System.Text.Json;
 
-var builder = Host.CreateApplicationBuilder(args);
-
-// 配置文件定位策略：优先使用当前工作目录下的 appsettings.json（便于直接编辑项目目录中的配置），
-// 但 CWD 下可能存在与本服务无关的同名配置（.NET 项目极常见），仅当包含 SqlServer 配置节时才采用，
-// 否则回退到输出目录中的副本。加载后清空默认配置源并按此顺序重建。
+// 配置目录解析先完成（stdio / http 两条路径共用）
 var configDirectory = ResolveConfigDirectory();
-var configurationSources = (IConfigurationBuilder)builder.Configuration;
-configurationSources.Sources.Clear();
-configurationSources
-    .SetBasePath(configDirectory)
-    // optional: true —— 配置文件缺失（如用户刚解压发布包、或容器未挂载配置）时，
-    // 不以晦涩的 FileNotFoundException 退出，而是由启动自检给出可操作的中文提示（见 StartupDiagnostics）
-    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
-    .AddEnvironmentVariables();
+var transport = ResolveTransport(configDirectory);
 
-// 强类型配置绑定
-builder.Services.Configure<SqlServerOptions>(
-    builder.Configuration.GetSection(SqlServerOptions.SectionName));
+// http 模式：走 ASP.NET Core（Streamable HTTP 传输），支持远程/多客户端；鉴权由 ApiKey 中间件负责
+if (string.Equals(transport, "http", StringComparison.OrdinalIgnoreCase))
+{
+    await RunHttpAsync(args, configDirectory);
+    return;
+}
 
-// 核心服务注册为单例（各驱动连接池内部自行管理物理连接）
-builder.Services.AddSingleton<DatabaseProviderFactory>();
-builder.Services.AddSingleton<DatabaseService>();
-builder.Services.AddSingleton<SqlGuardService>();
-
-// 审计日志：日志目录挂在配置目录下（logs/audit-YYYYMMDD.log）
-builder.Services.AddSingleton(serviceProvider => new AuditLogger(
-    configDirectory,
-    serviceProvider.GetRequiredService<ILogger<AuditLogger>>()));
-
-// 启动自检：配置校验 + 审计日志保留清理 + 可选连通性预检（只告警不阻断）
-builder.Services.AddSingleton(serviceProvider => new StartupDiagnostics(
-    serviceProvider.GetRequiredService<IOptions<SqlServerOptions>>(),
-    serviceProvider.GetRequiredService<DatabaseProviderFactory>(),
-    serviceProvider.GetRequiredService<AuditLogger>(),
-    configDirectory,
-    serviceProvider.GetRequiredService<ILogger<StartupDiagnostics>>()));
-
-// MCP Server：stdio 本地传输，注册工具类型（新增工具类型必须在此注册，否则不生效）
-builder.Services
-    .AddMcpServer()
-    .WithStdioServerTransport()
-    .WithTools<ReadTools>()
-    .WithTools<WriteTools>()
-    .WithTools<AuditTools>();
+// ===== stdio（默认，行为与原实现一致）=====
+var builder = Host.CreateApplicationBuilder(args);
+ConfigureConfigSources(builder.Configuration, configDirectory);
+ConfigureServices(builder.Services, configDirectory, builder.Configuration, "stdio");
 
 // 日志全部输出到 stderr：stdout 是 MCP JSON-RPC 协议通道，不能被日志污染
 builder.Logging.AddConsole(options =>
@@ -65,6 +40,96 @@ var host = builder.Build();
 await host.Services.GetRequiredService<StartupDiagnostics>().RunAsync();
 
 await host.RunAsync();
+
+static async Task RunHttpAsync(string[] args, string configDirectory)
+{
+    var builder = WebApplication.CreateBuilder(args);
+    ConfigureConfigSources(builder.Configuration, configDirectory);
+    ConfigureServices(builder.Services, configDirectory, builder.Configuration, "http");
+
+    var options = builder.Configuration.GetSection(SqlServerOptions.SectionName).Get<SqlServerOptions>()!;
+    // Kestrel 监听地址通过 urls 配置键注入（ConfigureWebHostBuilder 无 UseUrls 扩展），0.0.0.0 允许容器/远程访问
+    builder.Configuration["urls"] = $"http://0.0.0.0:{options.HttpPort}";
+
+    // http 模式日志沿用默认控制台输出（无 stdio 协议，stdout 不被协议占用）；不重复 AddConsole 避免日志翻倍
+    var app = builder.Build();
+
+    // 鉴权中间件：本地白名单在远程场景下不再够用，http 必须靠 ApiKey 校验
+    var apiKey = options.ApiKey;
+    if (!string.IsNullOrWhiteSpace(apiKey))
+    {
+        app.Use(async (context, next) =>
+        {
+            var auth = context.Request.Headers["Authorization"].ToString();
+            var authorized = (auth.StartsWith("Bearer ", StringComparison.OrdinalIgnoreCase)
+                              && string.Equals(auth["Bearer ".Length..].Trim(), apiKey, StringComparison.Ordinal))
+                             || context.Request.Headers["X-Api-Key"].ToString() == apiKey;
+
+            if (authorized)
+            {
+                await next();
+            }
+            else
+            {
+                context.Response.StatusCode = 401;
+                await context.Response.WriteAsync("Unauthorized");
+            }
+        });
+    }
+
+    await app.Services.GetRequiredService<StartupDiagnostics>().RunAsync();
+    app.MapMcp("/mcp");
+    await app.RunAsync();
+}
+
+/// <summary>
+/// 配置源重建（stdio / http 共用）：清空默认源，仅保留配置目录下的 appsettings.json（可选）与环境变量覆盖。
+/// optional:true 保证配置文件缺失时不以 FileNotFoundException 退出，由启动自检给出中文提示。
+/// </summary>
+static void ConfigureConfigSources(IConfigurationManager config, string configDirectory)
+{
+    config.Sources.Clear();
+    config.SetBasePath(configDirectory)
+        .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
+        .AddEnvironmentVariables();
+}
+
+/// <summary>注册核心服务与 MCP Server（含工具与传输方式选择）。</summary>
+static void ConfigureServices(IServiceCollection services, string configDirectory, IConfiguration configuration, string transport)
+{
+    services.Configure<SqlServerOptions>(configuration.GetSection(SqlServerOptions.SectionName));
+
+    services.AddSingleton<DatabaseProviderFactory>();
+    services.AddSingleton<DatabaseService>();
+    services.AddSingleton<SqlGuardService>();
+
+    services.AddSingleton(serviceProvider => new AuditLogger(
+        configDirectory,
+        serviceProvider.GetRequiredService<ILogger<AuditLogger>>()));
+
+    services.AddSingleton(serviceProvider => new StartupDiagnostics(
+        serviceProvider.GetRequiredService<IOptions<SqlServerOptions>>(),
+        serviceProvider.GetRequiredService<DatabaseProviderFactory>(),
+        serviceProvider.GetRequiredService<AuditLogger>(),
+        configDirectory,
+        serviceProvider.GetRequiredService<ILogger<StartupDiagnostics>>()));
+
+    var mcp = services
+        .AddMcpServer()
+        .WithTools<ReadTools>()
+        .WithTools<WriteTools>()
+        .WithTools<AuditTools>();
+
+    if (string.Equals(transport, "http", StringComparison.OrdinalIgnoreCase))
+    {
+        // Streamable HTTP 传输：会话/鉴权通过 HttpServerTransportOptions 配置；本地白名单不足，靠 ApiKey 中间件兜底
+        mcp.WithHttpTransport(_ => { });
+    }
+    else
+    {
+        mcp.WithStdioServerTransport();
+    }
+}
 
 static string ResolveConfigDirectory()
 {
@@ -94,4 +159,37 @@ static bool IsValidConfigDirectory(string directory)
     {
         return false;
     }
+}
+
+/// <summary>解析传输方式：优先环境变量 SqlServer__Transport，其次 appsettings.json 的 SqlServer:Transport，默认 stdio。</summary>
+static string ResolveTransport(string configDirectory)
+{
+    var env = Environment.GetEnvironmentVariable("SqlServer__Transport");
+    if (!string.IsNullOrWhiteSpace(env))
+    {
+        return env!;
+    }
+
+    var path = Path.Combine(configDirectory, "appsettings.json");
+    if (!File.Exists(path))
+    {
+        return "stdio";
+    }
+
+    try
+    {
+        using var document = JsonDocument.Parse(File.ReadAllText(path));
+        if (document.RootElement.TryGetProperty("SqlServer", out var sqlServer) &&
+            sqlServer.TryGetProperty("Transport", out var transportValue) &&
+            transportValue.ValueKind == JsonValueKind.String)
+        {
+            return transportValue.GetString() ?? "stdio";
+        }
+    }
+    catch
+    {
+        // 解析失败时回退默认，不阻断启动
+    }
+
+    return "stdio";
 }

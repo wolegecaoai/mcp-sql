@@ -21,6 +21,18 @@ public class SqlServerOptions
     /// <summary>是否允许写操作（execute_non_query / execute_ddl）。设为 false 时写工具直接拒绝执行。</summary>
     public bool AllowWrite { get; set; } = true;
 
+    /// <summary>传输方式：stdio（默认，本机单客户端）/ http（Streamable HTTP，支持远程/多客户端，需配合 ApiKey 鉴权）。</summary>
+    public string Transport { get; set; } = "stdio";
+
+    /// <summary>http 模式监听端口（默认 5000）。</summary>
+    public int HttpPort { get; set; } = 5000;
+
+    /// <summary>
+    /// http 模式鉴权密钥；客户端须通过 <c>Authorization: Bearer &lt;ApiKey&gt;</c> 或 <c>X-Api-Key</c> 请求头携带。
+    /// 为空时 http 模式拒绝所有请求（fail-closed）。
+    /// </summary>
+    public string? ApiKey { get; set; }
+
     /// <summary>
     /// 单次查询响应的字符预算（近似值），默认 60000 字符（≈15000 tokens）。
     /// 行数上限之外的第二道闸：宽表或含大文本的行即便行数不多也可能打爆模型上下文。

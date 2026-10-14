@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.IO.Compression;
 using System.Text;
 // NumberStyles 需要 System.Globalization（已引入）
 
@@ -108,4 +109,113 @@ public static class ExportFormatter
 
     private static string EscapeMarkdownCell(string cell) =>
         cell.Replace("|", "\\|").Replace("\r\n", " ").Replace("\n", " ").Replace("\r", " ");
+
+    /// <summary>
+    /// 导出为 .xlsx 的 base64 字符串（自包含、无第三方依赖，手写最小 Office Open XML 包）。
+    /// 调用方将返回值保存为 .xlsx 打开即可。字符串单元格采用内联字符串，并对公式注入字符做与 CSV 一致的防护。
+    /// </summary>
+    public static string ToXlsx(QueryResult result)
+    {
+        var columns = GetColumnNames(result);
+        using var memory = new MemoryStream();
+        using (var archive = new ZipArchive(memory, ZipArchiveMode.Create, true))
+        {
+            AddZipEntry(archive, "[Content_Types].xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Types xmlns=\"http://schemas.openxmlformats.org/package/2006/content-types\">" +
+                "<Default Extension=\"rels\" ContentType=\"application/vnd.openxmlformats-package.relationships+xml\"/>" +
+                "<Default Extension=\"xml\" ContentType=\"application/xml\"/>" +
+                "<Override PartName=\"/xl/workbook.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml\"/>" +
+                "<Override PartName=\"/xl/worksheets/sheet1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml\"/>" +
+                "</Types>");
+
+            AddZipEntry(archive, "_rels/.rels",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument\" Target=\"xl/workbook.xml\"/>" +
+                "</Relationships>");
+
+            AddZipEntry(archive, "xl/workbook.xml",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<workbook xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\" " +
+                "xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\">" +
+                "<sheets><sheet name=\"Sheet1\" sheetId=\"1\" r:id=\"rId1\"/></sheets></workbook>");
+
+            AddZipEntry(archive, "xl/_rels/workbook.xml.rels",
+                "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>" +
+                "<Relationships xmlns=\"http://schemas.openxmlformats.org/package/2006/relationships\">" +
+                "<Relationship Id=\"rId1\" Type=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet\" Target=\"worksheets/sheet1.xml\"/>" +
+                "</Relationships>");
+
+            var sheet = new StringBuilder();
+            sheet.Append("<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>");
+            sheet.Append("<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><sheetData>");
+            sheet.Append(BuildXlsxRow(1, columns.Select(c => (object?)c)));
+            var rowIndex = 2;
+            foreach (var row in result.Rows)
+            {
+                sheet.Append(BuildXlsxRow(rowIndex, columns.Select(c => row.TryGetValue(c, out var v) ? v : null)));
+                rowIndex++;
+            }
+
+            sheet.Append("</sheetData></worksheet>");
+            AddZipEntry(archive, "xl/worksheets/sheet1.xml", sheet.ToString());
+        }
+
+        return Convert.ToBase64String(memory.ToArray());
+    }
+
+    private static void AddZipEntry(ZipArchive archive, string path, string content)
+    {
+        var entry = archive.CreateEntry(path);
+        using var writer = new StreamWriter(entry.Open(), new UTF8Encoding(false));
+        writer.Write(content);
+    }
+
+    private static string BuildXlsxRow(int rowIndex, IEnumerable<object?> values)
+    {
+        var builder = new StringBuilder();
+        builder.Append("<row r=\"").Append(rowIndex).Append("\">");
+        var column = 1;
+        foreach (var value in values)
+        {
+            var reference = ColumnLetter(column) + rowIndex;
+            if (value is null)
+            {
+                builder.Append("<c r=\"").Append(reference).Append("\"/>");
+            }
+            else if (value is string text)
+            {
+                // 与 CSV 一致的公式注入防护：开头为 = + - @（含不可见前缀）时加 ' 转义为文本
+                var safe = SanitizeFormulaInjection(text);
+                builder.Append("<c r=\"").Append(reference).Append("\" t=\"inlineStr\"><is><t xml:space=\"preserve\">")
+                    .Append(SafeXml(safe)).Append("</t></is></c>");
+            }
+            else
+            {
+                builder.Append("<c r=\"").Append(reference).Append("\"><v>").Append(SafeXml(FormatValue(value))).Append("</v></c>");
+            }
+
+            column++;
+        }
+
+        builder.Append("</row>");
+        return builder.ToString();
+    }
+
+    private static string ColumnLetter(int index)
+    {
+        var letter = string.Empty;
+        while (index > 0)
+        {
+            var remainder = (index - 1) % 26;
+            letter = (char)('A' + remainder) + letter;
+            index = (index - 1) / 26;
+        }
+
+        return letter;
+    }
+
+    private static string SafeXml(string text) =>
+        text.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;").Replace("\"", "&quot;").Replace("'", "&apos;");
 }
