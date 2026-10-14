@@ -1,0 +1,21 @@
+# 构建上下文排除项：镜像内绝不包含真实配置、审计日志与构建产物
+**/bin/
+**/obj/
+publish/
+
+# 含真实连接串与密码：严禁进入镜像（运行时通过挂载提供）
+appsettings.json
+
+# 审计日志含 SQL 预览与库名
+logs/
+
+# 测试与仓库元数据不参与运行时镜像
+tests/
+.github/
+.codebuddy/
+.git/
+.gitignore
+AGENTS.md
+docker-compose.test.yml
+*.user
+*.suo

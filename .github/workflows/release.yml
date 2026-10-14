@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  # 各平台独立打包并上传为 workflow artifact；发布动作集中在下一个 job，
+  # 避免多个 job 并发创建/更新同一个 Release 造成竞态（M1）
+  package:
+    name: 打包 ${{ matrix.rid }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            archive: zip
+          - rid: linux-x64
+            archive: tar.gz
+          - rid: osx-x64
+            archive: tar.gz
+          - rid: osx-arm64
+            archive: tar.gz
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+
+      - name: 发布（framework-dependent，目标平台自包含 apphost）
+        run: >
+          dotnet publish SqlServerMcp.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          --self-contained false
+          -o out/${{ matrix.rid }}
+
+      # 安全关键步骤：包内不出现仓库里的真实配置，只保留无凭据的模板，
+      # 并额外放一份由模板生成的 appsettings.json，保证解压即可启动（用户再填自己的连接串）。
+      - name: 剔除真实配置并准备模板配置
+        run: |
+          rm -f out/${{ matrix.rid }}/appsettings.json
+          test -f out/${{ matrix.rid }}/appsettings.example.json
+          cp appsettings.example.json out/${{ matrix.rid }}/appsettings.json
+          echo "产物内 appsettings.json 由示例模板生成，不含任何真实凭据"
+
+      - name: 守护检查（产物中不得出现内网地址或口令特征）
+        run: |
+          if grep -rInE '192\.168\.|[0-9]{8,}' out/${{ matrix.rid }}/appsettings.json; then
+            echo "::error::发布产物疑似包含真实凭据特征，已中止"
+            exit 1
+          fi
+
+      - name: 打包
+        run: |
+          cd out/${{ matrix.rid }}
+          if [ "${{ matrix.archive }}" = "zip" ]; then
+            zip -r "../../SqlServerMcp-${{ matrix.rid }}.zip" .
+          else
+            tar -czf "../../SqlServerMcp-${{ matrix.rid }}.tar.gz" .
+          fi
+
+      - name: 上传该平台产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: SqlServerMcp-${{ matrix.rid }}
+          path: |
+            SqlServerMcp-${{ matrix.rid }}.zip
+            SqlServerMcp-${{ matrix.rid }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: 附加到 GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部平台产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 校验产物清单（四个平台各一份）
+        run: |
+          ls -l dist
+          count=$(ls dist | wc -l)
+          if [ "$count" -ne 4 ]; then
+            echo "::error::预期 4 个平台产物，实际 $count 个"
+            exit 1
+          fi
+
+      - name: 附加到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

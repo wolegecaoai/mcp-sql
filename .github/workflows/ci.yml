@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# 仓库为公开仓库：CI 中不出现任何真实凭据。
+# appsettings.json 已被 .gitignore 排除，CI 用示例模板生成占位配置（服务本身不在 CI 中启动）。
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build-and-unit-test:
+    name: 构建与单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+
+      - name: 生成 CI 配置（示例模板 → appsettings.json）
+        run: cp appsettings.example.json appsettings.json
+
+      # 注意：仓库无 .sln，根目录 dotnet build 只会构建主项目（它不引用测试项目），
+      # 因此这里的还原/构建必须以**测试项目**为目标，否则后面的 --no-build 找不到测试程序集
+      - name: 还原
+        run: dotnet restore tests/SqlServerMcp.Tests
+
+      - name: 构建（Release）
+        run: dotnet build tests/SqlServerMcp.Tests --no-restore -c Release
+
+      # 测试项目已配置默认过滤器 Category!=Integration，此处无需额外参数即排除集成测试
+      - name: 单元测试
+        run: dotnet test tests/SqlServerMcp.Tests --no-build -c Release --logger "console;verbosity=normal"
+
+  integration-test:
+    name: 真实数据库集成测试（MySQL / PostgreSQL）
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: it_root_pw
+          MYSQL_DATABASE: mcp_it
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pit_root_pw"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=20s
+
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: it_pg_pw
+          POSTGRES_DB: mcp_it
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d mcp_it"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+          --health-start-period=10s
+
+    # 测试容器的一次性弱口令（与真实环境无关）；AllowPublicKeyRetrieval 供 MySQL 8 的
+    # caching_sha2_password 在非 TLS 连接上完成首次认证
+    env:
+      SQLSERVERMCP_IT_MYSQL: "Server=127.0.0.1;Port=3306;Database=mcp_it;User=root;Password=it_root_pw;AllowPublicKeyRetrieval=True;"
+      SQLSERVERMCP_IT_POSTGRESQL: "Host=127.0.0.1;Port=5432;Database=mcp_it;Username=postgres;Password=it_pg_pw;"
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+          cache: true
+          cache-dependency-path: '**/*.csproj'
+
+      - name: 生成 CI 配置（示例模板 → appsettings.json）
+        run: cp appsettings.example.json appsettings.json
+
+      - name: 还原
+        run: dotnet restore tests/SqlServerMcp.Tests
+
+      - name: 构建（Release）
+        run: dotnet build tests/SqlServerMcp.Tests --no-restore -c Release
+
+      # 显式 filter 覆盖测试项目里的默认排除值（默认值见测试 csproj 的 VSTestTestCaseFilter）
+      - name: 集成测试
+        run: dotnet test tests/SqlServerMcp.Tests --no-build -c Release --filter "Category=Integration" --logger "console;verbosity=normal"

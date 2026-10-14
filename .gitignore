@@ -5,6 +5,9 @@ obj/
 .vs/
 publish/
 
+# RID 发布/打包临时输出（release 工作流与本地冒烟使用；内含 appsettings.json 副本，禁止提交）
+out/
+
 # 含数据库连接字符串与密码，禁止提交到版本库
 appsettings.json
 

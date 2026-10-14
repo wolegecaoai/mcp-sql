@@ -21,7 +21,14 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="appsettings.json">
+    <!-- appsettings.json 含真实凭据且已被 .gitignore 排除：CI / 发布环境中该文件可能根本不存在，
+         故用条件包含，避免无条件 Include 导致构建失败 -->
+    <Content Include="appsettings.json" Condition="Exists('appsettings.json')">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+
+    <!-- 示例模板恒随构建输出，供 CI（生成 appsettings.json）与发布产物（不含真实凭据）使用 -->
+    <Content Include="appsettings.example.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>

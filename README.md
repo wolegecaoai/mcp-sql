@@ -42,12 +42,17 @@ dotnet publish -c Release -o publish
 
 ## 配置说明（appsettings.json）
 
+> **起步方式**：把仓库中的 `appsettings.example.json` 复制为 `appsettings.json`，再填写自己的连接串。
+> `appsettings.json` 已被 `.gitignore` 排除（含真实密码）；示例模板可安全提交，且被 CI 与发布产物使用。
+> 配置缺失时服务不会崩溃——启动自检会在 stderr 给出中文提示，工具则回报「没有授权数据库」。
+
 ```json
 {
   "SqlServer": {
     "CommandTimeoutSeconds": 30,
-    "MaxRows": 500,
     "AllowWrite": true,
+    "AuditRetentionDays": 30,
+    "StartupConnectivityCheck": false,
     "DangerousKeywords": ["DROP DATABASE", "CREATE DATABASE", "..."],
     "Databases": {
       "MyDb": {
@@ -68,9 +73,12 @@ dotnet publish -c Release -o publish
 | `Databases` | 授权数据库字典。**键即 `database` 参数使用的别名**，值为连接信息（含 `Type`）与说明 |
 | `Type`（条目内） | 数据库类型：`sqlserver` / `mysql` / `postgresql` / `sqlite`。**缺省为 `sqlserver`**，未填写该字段的旧配置继续按 SQL Server 处理 |
 | `CommandTimeoutSeconds` | SQL 命令超时（秒），默认 30 |
-| `MaxRows` | `execute_query` 默认最大返回行数，默认 500 |
 | `AllowWrite` | 写操作总开关。设为 `false` 时 `execute_non_query`/`execute_ddl` 直接拒绝 |
+| `AuditRetentionDays` | 审计日志保留天数（默认 30，`0` 表示不清理）。启动时清理更早的日文件；**当日文件与目录内其他文件永不删除** |
+| `StartupConnectivityCheck` | 启动时是否对所有授权库做连通性预检（默认 `false`）。开启会增加启动耗时；失败**仅告警不阻断**启动 |
 | `DangerousKeywords` | 危险关键词黑名单（忽略注释与字符串字面量后匹配），命中即拒绝。覆盖实例级操作、权限提权语句，以及只读路径上的数据外发/文件读取函数（`OPENROWSET`、`dblink`、`pg_read_file`、`LOAD_FILE`、`INTO OUTFILE` 等） |
+
+> 注：历史配置项 `MaxRows` 无任何代码读取，已从模型中移除；实际行数由各工具的 `maxRows` 参数控制（默认 100，上限 5000）。
 
 **各数据库类型连接串示例**：
 
@@ -108,7 +116,10 @@ $env:SqlServer__Databases__MyDb__ConnectionString = "Server=...;Password=..."
 
 **写能力说明**：四类数据库均支持写操作，全部走 confirm 二次确认流程（见上方「各方言写操作差异」表了解 MySQL DDL 的特殊处理）。如需整体关闭写能力，把 `AllowWrite` 设为 `false` 即可。
 
-**审计日志**：写操作的提交/演练、守卫拒绝（黑名单/只读/单语句等拦截）、写执行失败都会以 JSON 行追加到 `<配置目录>/logs/audit-YYYYMMDD.log`。每条记录包含 UTC 时间戳、库别名、Provider、工具名、模式（commit/dry-run）、影响行数，以及 SQL 的 **SHA256 哈希与前 200 字符预览**（不落完整语句，避免敏感字面量全量落盘）。日志写入失败不会中断主流程（降级为 stderr 警告）。
+**审计日志**：写操作的提交/演练、守卫拒绝（黑名单/只读/单语句等拦截）、写执行失败与建连失败都会以 JSON 行追加到 `<配置目录>/logs/audit-YYYYMMDD.log`。每条记录包含 UTC 时间戳、库别名、Provider、工具名、模式（commit/dry-run）、影响行数，以及 SQL 的 **SHA256 哈希与前 200 字符预览**（不落完整语句，避免敏感字面量全量落盘）。日志写入失败不会中断主流程（降级为 stderr 警告）。
+
+- **可查询**：用 `query_audit_log` 工具回溯「刚才那次写影响了多少行」「哪些语句被守卫拦下」，支持按日期/库/事件类型/工具过滤（该工具**不接受路径参数**，日志目录由服务端固定，避免变为任意文件读取入口）。
+- **自动清理**：启动时按 `AuditRetentionDays`（默认 30 天）清理过期的已完成日文件；当日文件与目录内其他文件永不删除。
 
 ```json
 {"ts":"2026-10-14T08:45:18.1234567+00:00","event":"write","database":"PLC_DB","provider":"mysql","tool":"execute_ddl","mode":"commit","affected_rows":0,"sql_sha256":"…","sql_preview":"CREATE TABLE …"}
@@ -217,6 +228,47 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 
 > 注意：以上路径请按实际存放位置调整——Windows 的 JSON 字符串中反斜杠需转义为 `\\`；macOS / Linux 用正斜杠且无需转义。
 
+## Docker 部署（可选的隔离运行方式）
+
+镜像内置运行环境，真实配置**不打进镜像**（`.dockerignore` 排除 `appsettings.json`），运行时挂载：
+
+```bash
+docker build -t sqlserver-mcp .
+
+docker run -i --rm \
+  -v /path/to/your/appsettings.json:/app/appsettings.json:ro \
+  -v sqlserver-mcp-logs:/app/logs \
+  sqlserver-mcp
+```
+
+要点：
+
+- `-i` 必须保留（stdio 依赖 stdin）；**不要**用 `-t`，也**不要**用 `-d` 后台运行——客户端需要持有标准输入输出。
+- 配置挂载到 `/app/appsettings.json` 即生效（程序以工作目录 `/app` 为配置目录）；审计日志建议用卷持久化到 `/app/logs`。
+- 容器内访问宿主机数据库：Linux 用 `--network host`；Docker Desktop（Windows/macOS）把连接串里的 `localhost` 换成 `host.docker.internal`。
+- 客户端配置示例（CodeBuddy / OpenCode 的 `mcpServers`）：`"command": "docker"`，`"args": ["run", "-i", "--rm", "-v", "/abs/path/appsettings.json:/app/appsettings.json:ro", "sqlserver-mcp"]`。
+
+## 集成测试（真实 MySQL / PostgreSQL）
+
+大部分测试无需任何数据库；`Category=Integration` 的用例会连接真实实例，默认**被排除**（测试项目已配置默认过滤器），因此 `dotnet test tests/SqlServerMcp.Tests` 始终零依赖可跑。
+
+需要真实实例时：
+
+```bash
+docker compose -f docker-compose.test.yml up -d          # MySQL 8 (3307) + PostgreSQL 16 (5433)
+export SQLSERVERMCP_IT_MYSQL="Server=127.0.0.1;Port=3307;Database=mcp_it;User=root;Password=it_root_pw;AllowPublicKeyRetrieval=True;"
+export SQLSERVERMCP_IT_POSTGRESQL="Host=127.0.0.1;Port=5433;Database=mcp_it;Username=postgres;Password=it_pg_pw;"
+dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
+```
+
+连接串只经环境变量传入，**不落任何真实凭据到仓库**；缺少环境变量时用例会明确失败并提示启动方式（不静默跳过，避免假绿）。
+
+## CI 与发布
+
+- **CI**（`.github/workflows/ci.yml`）：push 到 `main` 与 PR 触发。`build-and-unit-test` job 构建并跑全部无依赖测试；`integration-test` job 用 GitHub Actions 的 `services:` 容器起 MySQL 8 与 PostgreSQL 16，注入环境变量后跑集成测试。
+- **发布**（`.github/workflows/release.yml`）：推送 `v*` 标签触发，产出 `win-x64` / `linux-x64` / `osx-x64` / `osx-arm64` 四个框架依赖包并附加到 Release。**打包前会删除仓库中的真实配置**、改用示例模板生成 `appsettings.json`，并有一步守护检查：产物中若出现内网地址或 8 位以上数字串则直接失败。
+- CI 中不出现任何真实凭据：`appsettings.json` 由 `appsettings.example.json` 生成（占位符），集成测试用一次性容器弱口令。
+
 ## 工具清单
 
 | 工具 | 类型 | 说明 |
@@ -230,6 +282,7 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 | `test_connection` | 只读 | 连通性检查：Provider 类型、服务器版本、当前库名、连接耗时（毫秒） |
 | `execute_query` | 只读 | 执行单条 SELECT/WITH 查询，返回 JSON 数组，行数受上限约束 |
 | `export_query_result` | 只读 | 执行只读查询并导出为 csv / markdown / json（CSV 含公式注入防护） |
+| `query_audit_log` | 只读 | 查询本服务的审计日志（写操作/守卫拒绝/执行失败），可按 UTC 日期、库、事件类型、工具过滤，返回最新若干条 |
 | `execute_non_query` | 写 | 执行单条 INSERT/UPDATE/DELETE，confirm 二次确认（四类数据库均支持） |
 | `execute_ddl` | 写 | 执行单条 DDL（CREATE/ALTER/DROP/TRUNCATE 等），confirm 二次确认（四类数据库均支持） |
 
@@ -280,14 +333,18 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 | 提示不支持的数据库类型 | 条目 `Type` 只能是 sqlserver/mysql/postgresql/sqlite（缺省 sqlserver） |
 | 构建时 NuGet 还原失败 | 项目已附带 `nuget.config` 锁定 nuget.org 源；若公司内网有专用源，可在其中追加 |
 | MCP 状态为红色 | 确认 `dotnet` 在 PATH 中；先用命令行 `dotnet run` 手动启动看 stderr 输出 |
+| 改了配置却不生效 | 启动日志第一条即输出「配置目录」——确认改的是该目录下的 `appsettings.json`（容器场景需挂载到 `/app/appsettings.json`） |
+| 构建报 `MSB3026/MSB3027 ... locked by SqlServerMcp` | 有 MCP 实例正在运行并占用 `bin/`（或 `publish/`）：先在客户端停止服务，或构建到独立目录（`dotnet build -o bin-test`） |
+| 想知道某次写操作的影响行数 | 用 `query_audit_log` 查询审计日志（默认查当天 UTC，可按库/事件类型/工具过滤） |
 
 ## 项目结构
 
 ```
-├── Program.cs                   # 入口：Generic Host + stdio 传输 + DI + stderr 日志
-├── appsettings.json             # 配置：授权数据库、超时、行数上限、黑名单
+├── Program.cs                   # 入口：Generic Host + stdio 传输 + DI + 启动自检
+├── appsettings.example.json     # 可提交的配置模板（占位符，无真实凭据）
+├── appsettings.json             # 你的实际配置（已 gitignore，含真实连接串）
 ├── Configuration/
-│   └── SqlServerOptions.cs      # 强类型配置模型
+│   └── SqlServerOptions.cs      # 强类型配置模型（含审计保留天数、自检开关）
 ├── Services/
 │   ├── IDatabaseProvider.cs       # Provider 接口（连接/目录查询/转义/能力标志/错误翻译约定）
 │   ├── DatabaseProviderFactory.cs # 按 Type 创建并缓存 Provider
@@ -295,17 +352,25 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 │   ├── SqlGuardService.cs         # 语句分类、单语句校验、黑名单、只读守卫、无 WHERE 识别
 │   ├── TableNameParser.cs         # 引号标识符感知的表名解析（四 Provider 共用）
 │   ├── ExportFormatter.cs         # CSV / Markdown / JSON 导出（含公式注入防护）
-│   ├── AuditLogger.cs             # 写操作与守卫拒绝的 JSON 行审计日志
+│   ├── AuditLogger.cs             # 审计日志：写入、查询、保留清理
+│   ├── StartupDiagnostics.cs      # 启动自检：配置校验 + 可选连通性预检（只告警不阻断）
 │   └── Providers/
 │       ├── SqlServerProvider.cs   # SQL Server（sys.* 目录）
 │       ├── MySqlProvider.cs       # MySQL（information_schema，DDL 不可事务化）
 │       ├── PostgreSqlProvider.cs  # PostgreSQL（pg_catalog + information_schema）
 │       └── SqliteProvider.cs      # SQLite（sqlite_master + PRAGMA）
-└── Tools/
-    ├── ReadTools.cs             # 9 个只读工具（含 test_connection / export_query_result）
-    └── WriteTools.cs            # 2 个写工具（confirm 二次确认）
+├── Tools/
+│   ├── ReadTools.cs             # 9 个只读工具（含 test_connection / export_query_result）
+│   ├── WriteTools.cs            # 2 个写工具（confirm 二次确认）
+│   └── AuditTools.cs            # query_audit_log（审计日志查询，不接受路径参数）
+├── Dockerfile / .dockerignore   # 容器化（stdio 运行，配置与日志走挂载）
+├── docker-compose.test.yml      # 集成测试依赖（MySQL 8 + PostgreSQL 16）
+├── .github/workflows/
+│   ├── ci.yml                   # 构建 + 单元测试 + service 容器集成测试
+│   └── release.yml              # tag 触发四平台发布（产物剔除真实配置）
 tests/
-└── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出 / 审计 / SQLite 写路径集成（175 项）
+└── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出 / 审计（含查询与保留）/ 自检 /
+                                 #              示例配置契约 / SQLite 写路径（296 项）+ MySQL/PG 集成测试（默认排除）
 logs/                            # 运行时生成的审计日志（已 gitignore）
 ```
 

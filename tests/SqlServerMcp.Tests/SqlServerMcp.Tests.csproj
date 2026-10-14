@@ -6,6 +6,10 @@
     <Nullable>enable</Nullable>
     <IsPackable>false</IsPackable>
     <IsTestProject>true</IsTestProject>
+
+    <!-- 默认排除真实数据库集成测试（Category=Integration，需环境变量提供连接串）：
+         本地 dotnet test 保持零依赖全绿；CI 的集成 job 用 filter 参数显式覆盖本默认值 -->
+    <VSTestTestCaseFilter Condition="'$(VSTestTestCaseFilter)' == ''">Category!=Integration</VSTestTestCaseFilter>
   </PropertyGroup>
 
   <ItemGroup>

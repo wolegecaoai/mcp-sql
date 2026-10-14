@@ -2,6 +2,7 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 using SqlServerMcp.Configuration;
 using SqlServerMcp.Services;
 using SqlServerMcp.Tools;
@@ -16,7 +17,9 @@ var configurationSources = (IConfigurationBuilder)builder.Configuration;
 configurationSources.Sources.Clear();
 configurationSources
     .SetBasePath(configDirectory)
-    .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+    // optional: true —— 配置文件缺失（如用户刚解压发布包、或容器未挂载配置）时，
+    // 不以晦涩的 FileNotFoundException 退出，而是由启动自检给出可操作的中文提示（见 StartupDiagnostics）
+    .AddJsonFile("appsettings.json", optional: true, reloadOnChange: true)
     .AddEnvironmentVariables();
 
 // 强类型配置绑定
@@ -33,12 +36,21 @@ builder.Services.AddSingleton(serviceProvider => new AuditLogger(
     configDirectory,
     serviceProvider.GetRequiredService<ILogger<AuditLogger>>()));
 
-// MCP Server：stdio 本地传输，注册工具类型
+// 启动自检：配置校验 + 审计日志保留清理 + 可选连通性预检（只告警不阻断）
+builder.Services.AddSingleton(serviceProvider => new StartupDiagnostics(
+    serviceProvider.GetRequiredService<IOptions<SqlServerOptions>>(),
+    serviceProvider.GetRequiredService<DatabaseProviderFactory>(),
+    serviceProvider.GetRequiredService<AuditLogger>(),
+    configDirectory,
+    serviceProvider.GetRequiredService<ILogger<StartupDiagnostics>>()));
+
+// MCP Server：stdio 本地传输，注册工具类型（新增工具类型必须在此注册，否则不生效）
 builder.Services
     .AddMcpServer()
     .WithStdioServerTransport()
     .WithTools<ReadTools>()
-    .WithTools<WriteTools>();
+    .WithTools<WriteTools>()
+    .WithTools<AuditTools>();
 
 // 日志全部输出到 stderr：stdout 是 MCP JSON-RPC 协议通道，不能被日志污染
 builder.Logging.AddConsole(options =>
@@ -46,7 +58,13 @@ builder.Logging.AddConsole(options =>
     options.LogToStandardErrorThreshold = LogLevel.Trace;
 });
 
-await builder.Build().RunAsync();
+var host = builder.Build();
+
+// 自检在启动传输之前执行：stdio 服务若启动即失败，客户端侧拿不到任何诊断信息，
+// 因此这里只输出警告、绝不退出（详见 StartupDiagnostics 的设计说明）。
+await host.Services.GetRequiredService<StartupDiagnostics>().RunAsync();
+
+await host.RunAsync();
 
 static string ResolveConfigDirectory()
 {

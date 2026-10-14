@@ -18,11 +18,20 @@ public class SqlServerOptions
     /// <summary>SQL 命令超时时间（秒）。</summary>
     public int CommandTimeoutSeconds { get; set; } = 30;
 
-    /// <summary>execute_query 默认最大返回行数。</summary>
-    public int MaxRows { get; set; } = 500;
-
     /// <summary>是否允许写操作（execute_non_query / execute_ddl）。设为 false 时写工具直接拒绝执行。</summary>
     public bool AllowWrite { get; set; } = true;
+
+    /// <summary>
+    /// 审计日志保留天数（按 UTC 日期切分的 audit-YYYYMMDD.log）。0 表示不清理。
+    /// 启动时清理早于该天数的已完成日志文件；当日文件与目录内其他文件永不删除。
+    /// </summary>
+    public int AuditRetentionDays { get; set; } = 30;
+
+    /// <summary>
+    /// 启动时是否对所有授权库做连通性预检（默认关闭）。开启后会增加启动耗时并对每个库建立一次连接，
+    /// 失败仅记录警告、不阻断启动。
+    /// </summary>
+    public bool StartupConnectivityCheck { get; set; } = false;
 
     /// <summary>
     /// 危险关键词黑名单：语句中（忽略注释与字符串字面量后）出现即拒绝执行，防止误操作整个实例。

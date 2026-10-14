@@ -1,0 +1,50 @@
+# 集成测试依赖：本地手动起 MySQL 8 与 PostgreSQL 16，供 Category=Integration 的用例使用。
+#
+# 用法：
+#   docker compose -f docker-compose.test.yml up -d        # 启动并等待健康检查通过
+#   docker compose -f docker-compose.test.yml down -v      # 用完清理（-v 同时删数据卷）
+#
+# 随后设置环境变量（PowerShell / bash 语法不同，按需选择）：
+#   PowerShell:
+#     $env:SQLSERVERMCP_IT_MYSQL      = "Server=127.0.0.1;Port=3307;Database=mcp_it;User=root;Password=it_root_pw;"
+#     $env:SQLSERVERMCP_IT_POSTGRESQL = "Host=127.0.0.1;Port=5433;Database=mcp_it;Username=postgres;Password=it_pg_pw;"
+#     dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
+#   bash:
+#     export SQLSERVERMCP_IT_MYSQL="Server=127.0.0.1;Port=3307;Database=mcp_it;User=root;Password=it_root_pw;"
+#     export SQLSERVERMCP_IT_POSTGRESQL="Host=127.0.0.1;Port=5433;Database=mcp_it;Username=postgres;Password=it_pg_pw;"
+#     dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
+#
+# 注意：这里的凭据是**一次性测试容器**的固定弱口令，与真实环境无关；
+# 端口刻意用 3307/5433，避免与本机已有的 3306/5432 实例冲突。
+
+services:
+  mysql-it:
+    image: mysql:8
+    ports:
+      - "3307:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: it_root_pw
+      MYSQL_DATABASE: mcp_it
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-pit_root_pw"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+  postgres-it:
+    image: postgres:16
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_PASSWORD: it_pg_pw
+      POSTGRES_DB: mcp_it
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d mcp_it"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
