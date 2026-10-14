@@ -74,6 +74,7 @@ dotnet publish -c Release -o publish
 | `Type`（条目内） | 数据库类型：`sqlserver` / `mysql` / `postgresql` / `sqlite`。**缺省为 `sqlserver`**，未填写该字段的旧配置继续按 SQL Server 处理 |
 | `CommandTimeoutSeconds` | SQL 命令超时（秒），默认 30 |
 | `AllowWrite` | 写操作总开关。设为 `false` 时 `execute_non_query`/`execute_ddl` 直接拒绝 |
+| `MaxResponseChars` | 单次查询响应的字符预算（近似值），默认 60000（≈15000 tokens）。**行数上限之外的第二道闸**：宽表或含大文本的行即便行数不多也可能打爆模型上下文。超预算时按行截断，并在响应信封里置 `truncated`/`notice`；设为 `0` 表示不限制 |
 | `AuditRetentionDays` | 审计日志保留天数（默认 30，`0` 表示不清理）。启动时清理更早的日文件；**当日文件与目录内其他文件永不删除** |
 | `StartupConnectivityCheck` | 启动时是否对所有授权库做连通性预检（默认 `false`）。开启会增加启动耗时；失败**仅告警不阻断**启动 |
 | `DangerousKeywords` | 危险关键词黑名单（忽略注释与字符串字面量后匹配），命中即拒绝。覆盖实例级操作、权限提权语句，以及只读路径上的数据外发/文件读取函数（`OPENROWSET`、`dblink`、`pg_read_file`、`LOAD_FILE`、`INTO OUTFILE` 等） |
@@ -269,6 +270,33 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 - **发布**（`.github/workflows/release.yml`）：推送 `v*` 标签触发，产出 `win-x64` / `linux-x64` / `osx-x64` / `osx-arm64` 四个框架依赖包并附加到 Release。**打包前会删除仓库中的真实配置**、改用示例模板生成 `appsettings.json`，并有一步守护检查：产物中若出现内网地址或 8 位以上数字串则直接失败。
 - CI 中不出现任何真实凭据：`appsettings.json` 由 `appsettings.example.json` 生成（占位符），集成测试用一次性容器弱口令。
 
+## 输出契约（对 AI 调用方友好）
+
+查询与目录类工具默认返回**信封**，**输出恒为合法 JSON**——元数据与截断/分页提示都在 JSON 内。（历史实现把「结果超过 N 行已截断…」这类中文提示追加在 JSON 数组之后，导致调用方 `JSON.parse` 必然失败。）
+
+```json
+{
+  "database": "PLC_DB",
+  "tool": "execute_query",
+  "columns": ["id", "dcode"],
+  "row_count": 2,
+  "truncated": true,
+  "skipped": 0,
+  "notice": "结果超过本次上限 2 行已截断：本次返回 2 行。可用 next.offset 续取，或用 maxRows 提高（上限 5000）、缩小查询范围。",
+  "next": { "offset": 2, "hint": "以相同 SQL 传入该 offset 可续取后续行；大表建议直接在 SQL 里 LIMIT/分页以减少扫描。" },
+  "rows": [{ "id": 1, "dcode": "OP50" }, { "id": 2, "dcode": "OP60" }]
+}
+```
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `response_format` | `envelope`（默认）/ `compact` / `rows` | `compact` 把键名只出现一次（行是数组、按 `columns` 顺序对齐），宽表可省约一半 token；`rows` 是历史裸数组形态（**不携带**元数据与提示），仅为兼容保留 |
+| `offset` | ≥0 | 跳过结果前 N 行用于续取：`next.offset = skipped + row_count`。代价是仍需读取被跳过的行，大表建议直接在 SQL 里分页 |
+
+调用建议：默认用 `envelope`（信息最全、可判断是否截断）；宽表批量取数用 `compact`；`rows` 只在你自行处理截断时使用。
+
+`list_databases` 另有两个富化能力：默认下发 `ddl_rehearsal`（该类型是否支持 DDL 演练）与 `supports_stored_procedures`；传 `include_server_info: true` 可逐库探测服务器版本与当前库名（会逐个建立连接、增加耗时，单库失败只影响该条目）。
+
 ## 工具清单
 
 | 工具 | 类型 | 说明 |
@@ -283,6 +311,7 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 | `execute_query` | 只读 | 执行单条 SELECT/WITH 查询，返回 JSON 数组，行数受上限约束 |
 | `export_query_result` | 只读 | 执行只读查询并导出为 csv / markdown / json（CSV 含公式注入防护） |
 | `query_audit_log` | 只读 | 查询本服务的审计日志（写操作/守卫拒绝/执行失败），可按 UTC 日期、库、事件类型、工具过滤，返回最新若干条 |
+| `list_databases`（可选参数） | 只读 | `include_server_info=true` 时逐库探测服务器版本与当前库名；默认输出已含 `ddl_rehearsal` 与 `supports_stored_procedures` |
 | `execute_non_query` | 写 | 执行单条 INSERT/UPDATE/DELETE，confirm 二次确认（四类数据库均支持） |
 | `execute_ddl` | 写 | 执行单条 DDL（CREATE/ALTER/DROP/TRUNCATE 等），confirm 二次确认（四类数据库均支持） |
 
@@ -369,8 +398,9 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 │   ├── ci.yml                   # 构建 + 单元测试 + service 容器集成测试
 │   └── release.yml              # tag 触发四平台发布（产物剔除真实配置）
 tests/
-└── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出 / 审计（含查询与保留）/ 自检 /
-                                 #              示例配置契约 / SQLite 写路径（296 项）+ MySQL/PG 集成测试（默认排除）
+└── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出（含输出信封）/ 只读工具契约 / 查询限额 /
+                                 #              审计（含查询与保留）/ 自检 / 示例配置契约 / SQLite 写路径（333 项）
+                                 #              + MySQL/PG 集成测试（默认排除）
 logs/                            # 运行时生成的审计日志（已 gitignore）
 ```
 

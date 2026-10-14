@@ -161,6 +161,11 @@ public sealed class StartupDiagnostics
             issues.Add($"AuditRetentionDays 不能为负数，当前为 {options.AuditRetentionDays}；负数等同 0（不清理审计日志）。");
         }
 
+        if (options.MaxResponseChars is > 0 and < 1000)
+        {
+            issues.Add($"MaxResponseChars 过小（当前 {options.MaxResponseChars}）：单次查询可能只返回极少量行，建议不小于 1000，或设为 0 表示不限制。");
+        }
+
         if (options.DangerousKeywords.Count == 0)
         {
             issues.Add("DangerousKeywords 为空：危险关键词黑名单（实例级操作、提权语句、数据外发函数）已全部失效，请确认这是有意为之。");

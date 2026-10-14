@@ -138,16 +138,18 @@ public sealed class AuditToolsTests : IDisposable
     }
 
     [Fact]
-    public void 日期不存在时给出说明而非空JSON()
+    public void 日期不存在时给出可解析的空信封()
     {
-        var result = Query(date: "2020-01-01");
+        using var document = JsonDocument.Parse(Query(date: "2020-01-01"));   // 空态也必须是合法 JSON
+        var root = document.RootElement;
 
-        Assert.Contains("未找到", result);
-        Assert.Contains("2020-01-01", result);
+        Assert.Equal(0, root.GetProperty("count").GetInt32());
+        Assert.Equal("2020-01-01", root.GetProperty("date").GetString());
+        Assert.Contains("未找到", root.GetProperty("notice").GetString());
     }
 
     [Fact]
-    public void 无匹配记录时给出说明并报告脏行数()
+    public void 无匹配记录时给出空信封并报告脏行数()
     {
         // 手工写一行损坏内容 + 一行合法内容
         var logsDirectory = Path.Combine(_directory, "logs");
@@ -156,10 +158,12 @@ public sealed class AuditToolsTests : IDisposable
             Path.Combine(logsDirectory, $"audit-{_today:yyyyMMdd}.log"),
             new[] { "不是 JSON", "{\"ts\":\"x\",\"event\":\"write\",\"database\":\"Other\"}" });
 
-        var result = Query(database: "NoSuchDb");
+        using var document = JsonDocument.Parse(Query(database: "NoSuchDb"));
+        var root = document.RootElement;
 
-        Assert.Contains("没有符合过滤条件", result);
-        Assert.Contains("1 行损坏记录", result);
+        Assert.Equal(0, root.GetProperty("count").GetInt32());
+        Assert.Equal(1, root.GetProperty("skipped_lines").GetInt32());
+        Assert.Contains("没有符合过滤条件", root.GetProperty("notice").GetString());
     }
 
     [Fact]

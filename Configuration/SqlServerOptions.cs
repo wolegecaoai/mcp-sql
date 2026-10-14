@@ -22,6 +22,13 @@ public class SqlServerOptions
     public bool AllowWrite { get; set; } = true;
 
     /// <summary>
+    /// 单次查询响应的字符预算（近似值），默认 60000 字符（≈15000 tokens）。
+    /// 行数上限之外的第二道闸：宽表或含大文本的行即便行数不多也可能打爆模型上下文。
+    /// 超预算时按行截断并在响应信封里置 truncated/notice；设为 0 或负数表示不限制。
+    /// </summary>
+    public int MaxResponseChars { get; set; } = 60000;
+
+    /// <summary>
     /// 审计日志保留天数（按 UTC 日期切分的 audit-YYYYMMDD.log）。0 表示不清理。
     /// 启动时清理早于该天数的已完成日志文件；当日文件与目录内其他文件永不删除。
     /// </summary>

@@ -258,6 +258,16 @@ public class ProviderTests
     }
 
     [Fact]
+    public void 存储过程支持位符合各方言能力()
+    {
+        // 工具层据此下发 supported:false，让调用方能区分「该方言不支持」与「确实没有对象」
+        Assert.True(_factory.GetProvider("sqlserver").SupportsStoredProcedures);
+        Assert.True(_factory.GetProvider("mysql").SupportsStoredProcedures);
+        Assert.True(_factory.GetProvider("postgresql").SupportsStoredProcedures);
+        Assert.False(_factory.GetProvider("sqlite").SupportsStoredProcedures);
+    }
+
+    [Fact]
     public void 四库均声明例程创建拦截规则()
     {
         // C2/CR-1：例程类语句改用正则规则（覆盖 CREATE OR ALTER / ALTER 等变体），

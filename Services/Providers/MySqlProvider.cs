@@ -16,6 +16,8 @@ public sealed class MySqlProvider : IDatabaseProvider
 
     public bool SupportsTransactionalDdl => false;
 
+    public bool SupportsStoredProcedures => true;
+
     // MySQL 账号与服务器级设置语句（全局黑名单的 CREATE LOGIN 等不覆盖 MySQL 方言）
     public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
     {

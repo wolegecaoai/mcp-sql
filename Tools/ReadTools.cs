@@ -6,40 +6,119 @@ using SqlServerMcp.Services;
 
 namespace SqlServerMcp.Tools;
 
-/// <summary>只读 MCP 工具集：数据库/表/结构探查与 SELECT 查询（目录 SQL 由各数据库 Provider 提供）。</summary>
+/// <summary>
+/// 只读 MCP 工具集：数据库/表/结构探查、SELECT 查询与导出。
+/// <para>
+/// 输出契约（对 AI 调用方友好）：查询与目录类工具默认返回**信封**（见 <see cref="ResponseFormatter"/>），
+/// 输出恒为合法 JSON——元数据（database/columns/row_count/truncated）与提示（notice/next）都在 JSON 内，
+/// 不再有「JSON 之后追加中文散文」这种无法解析的形态。
+/// </para>
+/// </summary>
 [McpServerToolType]
 public class ReadTools
 {
+    /// <summary>
+    /// 批量探测单库服务器信息的超时（秒）：刻意短于 CommandTimeoutSeconds，
+    /// 否则多个不可达库会把 list_databases 拖到几分钟。
+    /// </summary>
+    private const int ServerInfoProbeTimeoutSeconds = 5;
+
     [McpServerTool(Name = "list_databases", ReadOnly = true, Idempotent = true)]
-    [Description("列出本 MCP 服务器已授权的所有数据库别名、类型及说明。调用其他工具前先确认目标数据库别名。")]
-    public static string ListDatabases(DatabaseService databaseService)
+    [Description("列出已授权的数据库别名、类型与说明；并标注该类型是否支持 DDL 演练。可选探测各库版本与当前库名（并行探测、单库最多 5 秒，失败只影响该条目）。调用其他工具前先确认目标库别名。")]
+    public static async Task<string> ListDatabasesAsync(
+        DatabaseService databaseService,
+        [Description("是否探测各库服务器版本与当前库名，默认 false；探测为并行且单库限时 5 秒，失败只标记该条目")] bool includeServerInfo = false,
+        CancellationToken ct = default)
     {
         var databases = databaseService.GetDatabaseList();
         if (databases.Count == 0)
         {
-            return "尚未配置任何授权数据库。请在 appsettings.json 的 SqlServer:Databases 节中添加。";
+            // 空态也用信封：保持「输出恒为合法 JSON」的契约
+            return JsonSerializer.Serialize(new Dictionary<string, object?>
+            {
+                ["count"] = 0,
+                ["databases"] = Array.Empty<object>(),
+                ["notice"] = "尚未配置任何授权数据库。请在 appsettings.json 的 SqlServer:Databases 节中添加。"
+            }, DatabaseService.SerializerOptions);
         }
 
-        var lines = databases.Select(item =>
+        var items = new List<Dictionary<string, object?>>();
+        foreach (var (name, type, description) in databases)
         {
-            var description = string.IsNullOrWhiteSpace(item.Description) ? "" : $"：{item.Description}";
-            return $"- {item.Name}（{item.Type}）{description}";
-        });
+            var item = new Dictionary<string, object?>
+            {
+                ["database"] = name,
+                ["type"] = type,
+                ["description"] = description
+            };
 
-        return "已授权数据库：\n" + string.Join("\n", lines);
+            try
+            {
+                // 注意：必须按「类型」取 Provider；按别名取会因 "sqlite" 不是别名而抛错
+                var provider = databaseService.GetProviderByType(type);
+                item["display_name"] = provider.DisplayName;
+                item["ddl_rehearsal"] = provider.SupportsTransactionalDdl;
+                item["supports_stored_procedures"] = provider.SupportsStoredProcedures;
+            }
+            catch (McpException ex)
+            {
+                // 单个条目类型非法不应让整个发现调用失败
+                item["type_error"] = ex.Message;
+            }
+
+            items.Add(item);
+        }
+
+        if (includeServerInfo)
+        {
+            var probeResults = await databaseService.GetAllServerInfoAsync(ServerInfoProbeTimeoutSeconds, ct);
+            foreach (var (database, info, error) in probeResults)
+            {
+                var item = items.FirstOrDefault(entry =>
+                    string.Equals(entry["database"]?.ToString(), database, StringComparison.OrdinalIgnoreCase));
+                if (item is null)
+                {
+                    continue;
+                }
+
+                if (info is not null)
+                {
+                    item["connected"] = true;
+                    item["server_version"] = info.ServerVersion;
+                    item["current_database"] = info.CurrentDatabase;
+                    item["latency_ms"] = info.LatencyMs;
+                }
+                else
+                {
+                    item["connected"] = false;
+                    item["error"] = error;
+                }
+            }
+        }
+
+        var payload = new Dictionary<string, object?>
+        {
+            ["count"] = items.Count,
+            ["include_server_info"] = includeServerInfo,
+            ["databases"] = items
+        };
+
+        return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);
     }
 
     [McpServerTool(Name = "list_tables", ReadOnly = true, Idempotent = true)]
-    [Description("列出指定数据库中的所有用户表（schema、表名、近似行数）。")]
+    [Description("列出指定数据库的用户表（schema、表名、近似行数）。")]
     public static async Task<string> ListTablesAsync(
         DatabaseService databaseService,
-        [Description("目标数据库别名（必须是已授权库，可通过 list_databases 查看）")] string database)
+        [Description("目标数据库别名（必须是已授权库，可通过 list_databases 查看）")] string database,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("响应格式：envelope（默认，含元数据与提示）/ compact（列名只出现一次，更省 token）/ rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope)
     {
         var provider = databaseService.GetProvider(database);
-        var sql = provider.BuildListTablesSql();
+        var result = await databaseService.ExecuteQueryAsync(
+            database, provider.BuildListTablesSql(), maxRows: 10000, offset: Math.Max(0, offset));
 
-        var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 10000);
-        return result.ToJson() + TruncationNotice(result, 10000);
+        return ResponseFormatter.Format(result, database, "list_tables", responseFormat, 10000, limitAdjustable: false);
     }
 
     [McpServerTool(Name = "describe_table", ReadOnly = true, Idempotent = true)]
@@ -65,23 +144,29 @@ public class ReadTools
         var (foreignKeySql, foreignKeyParameters) = provider.BuildDescribeForeignKeysQuery(schema, tableName);
         var foreignKeys = await databaseService.ExecuteQueryAsync(database, foreignKeySql, maxRows: 1000, foreignKeyParameters);
 
-        var payload = new
+        // 带 database/schema 等自我描述字段：多轮对话中调用方无需自己记住上下文
+        var payload = new Dictionary<string, object?>
         {
-            table = tableName,
-            columns = columns.Rows,
-            primary_key = primaryKey.Rows,
-            foreign_keys = foreignKeys.Rows
+            ["database"] = database,
+            ["schema"] = schema,
+            ["table"] = tableName,
+            ["column_count"] = columns.Rows.Count,
+            ["columns"] = columns.Rows,
+            ["primary_key"] = primaryKey.Rows,
+            ["foreign_keys"] = foreignKeys.Rows
         };
 
         return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);
     }
 
     [McpServerTool(Name = "list_indexes", ReadOnly = true, Idempotent = true)]
-    [Description("列出指定数据库的索引（可按表名过滤），含索引类型、是否唯一、键列与包含列。注意：MySQL 的键列拼接受 group_concat_max_len（默认 1024 字符）限制，超长索引列表可能被截断。")]
+    [Description("列出指定数据库的索引（可按表名过滤），含索引类型、是否唯一、键列与包含列。")]
     public static async Task<string> ListIndexesAsync(
         DatabaseService databaseService,
         [Description("目标数据库别名（必须是已授权库）")] string database,
-        [Description("可选：仅查看某张表的索引，格式为 \"表名\" 或 \"schema.表名\"")] string? table = null)
+        [Description("可选：仅查看某张表的索引，格式为 \"表名\" 或 \"schema.表名\"")] string? table = null,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("响应格式：envelope（默认）/ compact / rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope)
     {
         var provider = databaseService.GetProvider(database);
 
@@ -93,50 +178,73 @@ public class ReadTools
         }
 
         var (sql, parameters) = provider.BuildListIndexesQuery(schema, tableName);
-        var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 5000, parameters);
-        return result.ToJson() + TruncationNotice(result, 5000);
+        var result = await databaseService.ExecuteQueryAsync(
+            database, sql, maxRows: 5000, parameters, offset: Math.Max(0, offset));
+
+        return ResponseFormatter.Format(result, database, "list_indexes", responseFormat, 5000, limitAdjustable: false);
     }
 
     [McpServerTool(Name = "list_views", ReadOnly = true, Idempotent = true)]
-    [Description("列出指定数据库中的所有视图（含定义前 500 字符）。")]
+    [Description("列出指定数据库的所有视图（含定义前 500 字符）。")]
     public static async Task<string> ListViewsAsync(
         DatabaseService databaseService,
-        [Description("目标数据库别名（必须是已授权库）")] string database)
+        [Description("目标数据库别名（必须是已授权库）")] string database,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("响应格式：envelope（默认）/ compact / rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope)
     {
         var provider = databaseService.GetProvider(database);
-        var sql = provider.BuildListViewsSql();
+        var result = await databaseService.ExecuteQueryAsync(
+            database, provider.BuildListViewsSql(), maxRows: 5000, offset: Math.Max(0, offset));
 
-        var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 5000);
-        return result.ToJson() + TruncationNotice(result, 5000);
+        return ResponseFormatter.Format(result, database, "list_views", responseFormat, 5000, limitAdjustable: false);
     }
 
     [McpServerTool(Name = "list_stored_procedures", ReadOnly = true, Idempotent = true)]
-    [Description("列出指定数据库中的所有存储过程（含定义前 500 字符；SQLite 等不支持的数据库返回空列表）。")]
+    [Description("列出指定数据库的所有存储过程/函数（含定义前 500 字符）。SQLite 无此概念，会返回 supported=false 的说明。")]
     public static async Task<string> ListStoredProceduresAsync(
         DatabaseService databaseService,
-        [Description("目标数据库别名（必须是已授权库）")] string database)
+        [Description("目标数据库别名（必须是已授权库）")] string database,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("响应格式：envelope（默认）/ compact / rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope)
     {
         var provider = databaseService.GetProvider(database);
-        var sql = provider.BuildListStoredProceduresSql();
 
-        var result = await databaseService.ExecuteQueryAsync(database, sql, maxRows: 5000);
-        return result.ToJson() + TruncationNotice(result, 5000);
+        // 方言不支持时直接返回说明，不建立连接——否则会暴露出与「查询不适用」无关的连接错误
+        if (!provider.SupportsStoredProcedures)
+        {
+            return ResponseFormatter.Format(
+                new QueryResult(new List<Dictionary<string, object?>>(), Truncated: false, ColumnCount: 0, ColumnNames: Array.Empty<string>()),
+                database,
+                "list_stored_procedures",
+                responseFormat,
+                limit: 0,
+                supported: false,
+                unsupportedReason: $"{provider.DisplayName} 没有存储过程/函数概念，此查询不适用。");
+        }
+
+        var result = await databaseService.ExecuteQueryAsync(
+            database, provider.BuildListStoredProceduresSql(), maxRows: 5000, offset: Math.Max(0, offset));
+
+        return ResponseFormatter.Format(result, database, "list_stored_procedures", responseFormat, 5000, limitAdjustable: false);
     }
 
     [McpServerTool(Name = "execute_query", ReadOnly = true, Idempotent = true)]
-    [Description("在指定数据库上执行只读 SELECT 查询（支持 WITH CTE）。仅允许单条查询语句，返回 JSON 数组结果。")]
+    [Description("在指定数据库上执行单条只读 SELECT 查询（支持 WITH CTE）。默认返回信封 JSON（含列名、行数、是否截断与提示）。")]
     public static async Task<string> ExecuteQueryAsync(
         DatabaseService databaseService,
         AuditLogger auditLogger,
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("要执行的 SELECT 语句（仅单条）")] string sql,
         [Description("最大返回行数，默认 100，上限 5000")] int maxRows = 100,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
+        [Description("响应格式：envelope（默认，含元数据与提示）/ compact（列名只出现一次，宽表可省约一半 token）/ rows（历史裸数组）")] string responseFormat = ResponseFormatter.Envelope,
         CancellationToken ct = default)
     {
-        // 只读守卫已下沉至 DatabaseService.ExecuteReadOnlyQueryAsync（M12）：单语句/分类/INTO/黑名单自动生效
         var limit = Math.Clamp(maxRows, 1, 5000);
-        var result = await ExecuteGuardedReadAsync(databaseService, auditLogger, database, "execute_query", sql, limit, ct);
-        return result.ToJson() + TruncationNotice(result, limit);
+        var result = await ExecuteGuardedReadAsync(
+            databaseService, auditLogger, database, "execute_query", sql, limit, Math.Max(0, offset), ct);
+
+        return ResponseFormatter.Format(result, database, "execute_query", responseFormat, limit);
     }
 
     [McpServerTool(Name = "test_connection", ReadOnly = true, Idempotent = true)]
@@ -146,29 +254,24 @@ public class ReadTools
         [Description("目标数据库别名（必须是已授权库，可通过 list_databases 查看）")] string database,
         CancellationToken ct = default)
     {
-        var provider = databaseService.GetProvider(database);
+        var info = await databaseService.GetServerInfoAsync(database, ct: ct);
 
-        var startedAt = System.Diagnostics.Stopwatch.StartNew();
-        var result = await databaseService.ExecuteQueryAsync(database, provider.BuildServerVersionSql(), maxRows: 1, ct: ct);
-        startedAt.Stop();
-
-        var row = result.Rows.Count > 0 ? result.Rows[0] : new Dictionary<string, object?>();
-        var payload = new
+        var payload = new Dictionary<string, object?>
         {
-            database,
-            provider = provider.ProviderId,
-            display_name = provider.DisplayName,
-            connected = true,
-            latency_ms = startedAt.ElapsedMilliseconds,
-            server_version = row.TryGetValue("server_version", out var version) ? version : null,
-            current_database = row.TryGetValue("current_database", out var current) ? current : null
+            ["database"] = info.Database,
+            ["provider"] = info.ProviderId,
+            ["display_name"] = info.DisplayName,
+            ["connected"] = true,
+            ["latency_ms"] = info.LatencyMs,
+            ["server_version"] = info.ServerVersion,
+            ["current_database"] = info.CurrentDatabase
         };
 
         return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);
     }
 
     [McpServerTool(Name = "export_query_result", ReadOnly = true, Idempotent = true)]
-    [Description("执行只读 SELECT 查询（支持 WITH CTE）并将结果导出为指定格式。仅允许单条查询语句，只读守卫与黑名单自动生效。")]
+    [Description("执行只读 SELECT 查询并导出为 csv / markdown / json。csv 保持机器可读纯净（不附加提示），json 返回含截断信息的信封，markdown 会在末尾附提示。")]
     public static async Task<string> ExportQueryResultAsync(
         DatabaseService databaseService,
         AuditLogger auditLogger,
@@ -176,24 +279,28 @@ public class ReadTools
         [Description("要执行的 SELECT 语句（仅单条）")] string sql,
         [Description("导出格式：csv（默认）/ markdown / json")] string format = "csv",
         [Description("最大导出行数，默认 100，上限 5000")] int maxRows = 100,
+        [Description("跳过结果前 N 行（分页续取用），默认 0")] int offset = 0,
         CancellationToken ct = default)
     {
         var limit = Math.Clamp(maxRows, 1, 5000);
-        var result = await ExecuteGuardedReadAsync(databaseService, auditLogger, database, "export_query_result", sql, limit, ct);
+        var result = await ExecuteGuardedReadAsync(
+            databaseService, auditLogger, database, "export_query_result", sql, limit, Math.Max(0, offset), ct);
 
         var normalizedFormat = format.Trim().ToLowerInvariant();
-        var content = normalizedFormat switch
+        return normalizedFormat switch
         {
             "csv" => ExportFormatter.ToCsv(result),
-            "markdown" or "md" => ExportFormatter.ToMarkdown(result),
-            "json" => ExportFormatter.ToJson(result),
+            "markdown" or "md" => ExportFormatter.ToMarkdown(result) + MarkdownNotice(result, limit),
+            "json" => ResponseFormatter.Format(result, database, "export_query_result", ResponseFormatter.Envelope, limit),
             _ => throw new McpException($"不支持的导出格式「{format}」。支持的格式：csv、markdown、json。")
         };
-
-        // CSV/JSON 保持机器可读纯净（截断提示会污染数据本身），提示仅附加于 Markdown（M3）
-        var notice = normalizedFormat is "markdown" or "md" ? TruncationNotice(result, limit) : string.Empty;
-        return content + notice;
     }
+
+    /// <summary>Markdown 是给人/模型阅读的散文形态，提示直接附在末尾即可。</summary>
+    private static string MarkdownNotice(QueryResult result, int limit) =>
+        result.Truncated
+            ? $"\n\n（注意：结果超过 {limit} 行已截断。可用 offset 续取，或缩小查询范围。）"
+            : string.Empty;
 
     /// <summary>
     /// 先做只读守卫校验（拒绝则记审计后抛出），再执行查询。
@@ -206,6 +313,7 @@ public class ReadTools
         string tool,
         string sql,
         int limit,
+        int offset,
         CancellationToken ct)
     {
         try
@@ -218,11 +326,6 @@ public class ReadTools
             throw;
         }
 
-        return await databaseService.ExecuteQueryAsync(database, sql, limit, ct: ct);
+        return await databaseService.ExecuteQueryAsync(database, sql, limit, ct: ct, offset: offset);
     }
-
-    private static string TruncationNotice(QueryResult result, int limit) =>
-        result.Truncated
-            ? $"\n\n（注意：结果超过 {limit} 行已截断。如需完整数据，请缩小查询范围或分页查询。）"
-            : string.Empty;
 }

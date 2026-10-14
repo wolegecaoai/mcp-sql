@@ -44,15 +44,18 @@ public class AuditTools
             tool,
             Math.Clamp(limit, 1, MaxLimit));
 
+        // 空态同样用信封：保持「输出恒为合法 JSON」的契约（提示放 notice，不要返回裸散文）
         if (!result.FileFound)
         {
-            return $"未找到 {targetDate:yyyy-MM-dd}（UTC）的审计日志文件，该日期可能尚未产生记录。";
+            return EmptyResult(targetDate, result.SkippedLines,
+                $"未找到 {targetDate:yyyy-MM-dd}（UTC）的审计日志文件，该日期可能尚未产生记录。");
         }
 
         if (result.Entries.Count == 0)
         {
             var skippedNote = result.SkippedLines > 0 ? $"另有 {result.SkippedLines} 行损坏记录已跳过。" : string.Empty;
-            return $"{targetDate:yyyy-MM-dd}（UTC）的审计日志中没有符合过滤条件的记录。{skippedNote}";
+            return EmptyResult(targetDate, result.SkippedLines,
+                $"{targetDate:yyyy-MM-dd}（UTC）的审计日志中没有符合过滤条件的记录。{skippedNote}");
         }
 
         var payload = new
@@ -62,6 +65,21 @@ public class AuditTools
             skipped_lines = result.SkippedLines,
             hint = "ts 为 UTC 时间；sql_sha256 可用于比对接同一语句的多次调用；mode=commit 表示已提交，dry-run 表示演练回滚。",
             entries = result.Entries.Select(ToWireFormat).ToList()
+        };
+
+        return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);
+    }
+
+    /// <summary>空结果信封（含提示与脏行数），保证输出始终可被 JSON 解析。</summary>
+    private static string EmptyResult(DateOnly date, int skippedLines, string notice)
+    {
+        var payload = new
+        {
+            date = date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+            count = 0,
+            skipped_lines = skippedLines,
+            notice,
+            entries = Array.Empty<object>()
         };
 
         return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);

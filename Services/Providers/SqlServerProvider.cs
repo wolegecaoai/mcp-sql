@@ -15,6 +15,8 @@ public sealed class SqlServerProvider : IDatabaseProvider
 
     public bool SupportsTransactionalDdl => true;
 
+    public bool SupportsStoredProcedures => true;
+
     // SQL Server 附加黑名单：非例程类的方言专属危险语句
     public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
     {

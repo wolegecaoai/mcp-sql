@@ -18,10 +18,23 @@ public record QueryResult(
     List<Dictionary<string, object?>> Rows,
     bool Truncated,
     int ColumnCount,
-    IReadOnlyList<string>? ColumnNames = null)
+    IReadOnlyList<string>? ColumnNames = null,
+    int SkippedRows = 0,
+    bool TruncatedBySize = false,
+    int RequestedOffset = 0)
 {
+    /// <summary>裸数组形态（历史输出；新调用方应使用 <see cref="ResponseFormatter"/> 的信封）。</summary>
     public string ToJson() => JsonSerializer.Serialize(Rows, DatabaseService.SerializerOptions);
 }
+
+/// <summary>数据库连通性与服务器信息（test_connection 与 list_databases 共用）。</summary>
+public sealed record ServerInfo(
+    string Database,
+    string ProviderId,
+    string DisplayName,
+    object? ServerVersion,
+    object? CurrentDatabase,
+    long LatencyMs);
 
 /// <summary>
 /// 数据库访问核心服务：授权库白名单解析、Provider 路由、通用查询执行（DbConnection 抽象）、事务化写操作。
@@ -88,6 +101,13 @@ public class DatabaseService
                 Type: string.IsNullOrWhiteSpace(pair.Value.Type) ? "sqlserver" : pair.Value.Type,
                 Description: pair.Value.Description ?? string.Empty))
             .ToList();
+
+    /// <summary>
+    /// 按**数据库类型标识**（配置里的 Type 字段）获取 Provider，而不是按别名——
+    /// 注意与 <see cref="GetProvider(string)"/> 区分：后者按别名解析（未授权会抛错）。
+    /// 供 list_databases 富化等「只知类型、不知别名」的场景使用。
+    /// </summary>
+    public IDatabaseProvider GetProviderByType(string? type) => _providerFactory.GetProvider(type);
 
     /// <summary>按别名解析授权数据库（大小写不敏感），未授权返回 false。</summary>
     public bool TryGetDatabase(string database, [MaybeNullWhen(false)] out DatabaseEntry entry)
@@ -186,6 +206,97 @@ public class DatabaseService
     }
 
     /// <summary>
+    /// 探测连通性与服务器信息（版本、当前库）——test_connection 与 list_databases 共用，
+    /// 避免两处各写一遍版本探测。执行的是 Provider 自身生成的 SQL，无注入面。
+    /// 失败抛已翻译的 <see cref="McpException"/>，由调用方决定整体失败还是逐库报告。
+    /// </summary>
+    public async Task<ServerInfo> GetServerInfoAsync(
+        string database, int? commandTimeoutSeconds = null, CancellationToken ct = default)
+    {
+        var provider = GetProvider(database);
+        var startedAt = System.Diagnostics.Stopwatch.StartNew();
+
+        // 超时必须覆盖**建连**阶段：CommandTimeout 只约束命令执行，而驱动的 Connect Timeout 默认约 15 秒，
+        // 仅靠它会破坏「单库限时 N 秒」的承诺（I4）
+        using var timeoutSource = commandTimeoutSeconds is > 0
+            ? CancellationTokenSource.CreateLinkedTokenSource(ct)
+            : null;
+
+        if (timeoutSource is not null)
+        {
+            timeoutSource.CancelAfter(TimeSpan.FromSeconds(commandTimeoutSeconds!.Value));
+        }
+
+        var token = timeoutSource?.Token ?? ct;
+
+        try
+        {
+            var result = await ExecuteQueryAsync(
+                database, provider.BuildServerVersionSql(), maxRows: 1, ct: token,
+                commandTimeoutSeconds: commandTimeoutSeconds ?? 0);
+            startedAt.Stop();
+
+            var row = result.Rows.Count > 0 ? result.Rows[0] : new Dictionary<string, object?>();
+
+            return new ServerInfo(
+                database,
+                provider.ProviderId,
+                provider.DisplayName,
+                row.TryGetValue("server_version", out var version) ? version : null,
+                row.TryGetValue("current_database", out var current) ? current : null,
+                startedAt.ElapsedMilliseconds);
+        }
+        catch (OperationCanceledException) when (timeoutSource is not null && !ct.IsCancellationRequested)
+        {
+            // 本库超时（非外部取消）：翻译成中文交由调用方逐库报告
+            throw new McpException(
+                $"数据库「{database}」连通性探测超时（超过 {commandTimeoutSeconds} 秒）。" +
+                "请检查主机可达性、端口与防火墙，或适当增大 SqlServer:CommandTimeoutSeconds。",
+                new TimeoutException($"探测「{database}」超时"));
+        }
+    }
+
+    /// <summary>
+    /// 批量探测所有授权库的服务器信息（list_databases 的 includeServerInfo 用）。
+    /// **并行 + 单库短超时**：串行时不可达库会各等一个命令超时（默认 30 秒），N 个库能把调用拖到几分钟；
+    /// 单个库失败只记录错误，不影响其他库。
+    /// </summary>
+    public async Task<IReadOnlyList<(string Database, ServerInfo? Info, string? Error)>> GetAllServerInfoAsync(
+        int commandTimeoutSeconds = 5, CancellationToken ct = default)
+    {
+        var tasks = _databases.Keys
+            .OrderBy(name => name, StringComparer.OrdinalIgnoreCase)
+            .Select(async name =>
+            {
+                try
+                {
+                    var info = await GetServerInfoAsync(name, commandTimeoutSeconds, ct);
+                    return (Database: name, Info: (ServerInfo?)info, Error: (string?)null);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    throw;   // 外部取消应整体传播，而不是被当作单库失败
+                }
+                catch (OperationCanceledException)
+                {
+                    return (Database: name, Info: (ServerInfo?)null, Error: (string?)"探测被取消或超时");
+                }
+                catch (McpException ex)
+                {
+                    return (Database: name, Info: (ServerInfo?)null, Error: (string?)ex.Message);
+                }
+                catch (Exception ex)
+                {
+                    // 未预期异常同样只影响该条目，否则「单库失败隔离」对异常类型不成立（I5）
+                    return (Database: name, Info: (ServerInfo?)null, Error: (string?)$"未预期的错误：{ex.Message}");
+                }
+            })
+            .ToList();
+
+        return await Task.WhenAll(tasks);
+    }
+
+    /// <summary>
     /// 打开到指定授权数据库的连接，连接失败时由 Provider 翻译为可操作的中文错误。
     /// internal（IM-1）：裸连接是"无守卫执行任意 SQL"的逃逸口，仅在程序集内部与测试（InternalsVisibleTo）可用。
     /// </summary>
@@ -227,22 +338,30 @@ public class DatabaseService
 
     /// <summary>
     /// 执行查询并读取最多 maxRows 行。超出上限时截断（Truncated=true），避免大结果集打爆上下文。
+    /// 另有第二道闸：按字符预算（<see cref="SqlServerOptions.MaxResponseChars"/>）截断，
+    /// 因为宽表/含大文本的行即便行数不多也可能打爆上下文。
     /// internal（I1）：查询类调用必须走 <see cref="ExecuteReadOnlyQueryAsync"/>（内含只读守卫），
     /// 外部程序集无法绕过守卫直接调用本方法。测试通过 InternalsVisibleTo 访问。
     /// </summary>
+    /// <param name="offset">跳过结果集的前 N 行（分页续取用；注意读取代价仍存在）。</param>
+    /// <param name="maxChars">字符预算覆盖值；≤0 表示使用配置默认。</param>
+    /// <param name="commandTimeoutSeconds">命令超时覆盖值；≤0 表示使用配置默认（批量探测用短超时）。</param>
     internal async Task<QueryResult> ExecuteQueryAsync(
         string database,
         string sql,
         int maxRows,
         IEnumerable<DbParameter>? parameters = null,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        int offset = 0,
+        int maxChars = 0,
+        int commandTimeoutSeconds = 0)
     {
         var provider = GetProvider(database);
         var connection = await OpenConnectionAsync(database, ct);
         await using var _ = connection;
 
         // CommandTimeoutSeconds=0 在 ADO.NET 中表示永不超时，钳制为至少 1 秒（M7）
-        var commandTimeout = Math.Max(1, _options.CommandTimeoutSeconds);
+        var commandTimeout = Math.Max(1, commandTimeoutSeconds > 0 ? commandTimeoutSeconds : _options.CommandTimeoutSeconds);
 
         await using var command = connection.CreateCommand();
         command.CommandText = sql;
@@ -259,6 +378,10 @@ public class DatabaseService
 
         var rows = new List<Dictionary<string, object?>>();
         var truncated = false;
+        var truncatedBySize = false;
+        var skipped = 0;
+        var rowChars = 0;
+        var charBudget = maxChars > 0 ? maxChars : _options.MaxResponseChars;
         var columnCount = 0;
         string[] names = Array.Empty<string>();
         try
@@ -284,6 +407,13 @@ public class DatabaseService
 
             while (await reader.ReadAsync(ct))
             {
+                // 分页：先跳过结果集前 offset 行（代价是仍需读取这些行，故仅作为续取手段）
+                if (skipped < offset)
+                {
+                    skipped++;
+                    continue;
+                }
+
                 if (rows.Count >= maxRows)
                 {
                     truncated = true;
@@ -293,11 +423,31 @@ public class DatabaseService
                 var row = new Dictionary<string, object?>(columnCount, StringComparer.OrdinalIgnoreCase);
                 for (var i = 0; i < columnCount; i++)
                 {
-                    row[names[i]] = await reader.IsDBNullAsync(i)
+                    var value = await reader.IsDBNullAsync(i)
                         ? null
                         : NormalizeValue(reader.GetValue(i));
+
+                    // 单值上限：一个超长 TEXT/BLOB 列就能单独打爆上下文，
+                    // 故单值不得超过整体预算（截断处留明确标记，避免"看起来是完整数据"）
+                    if (charBudget > 0 && value is string text && text.Length > charBudget)
+                    {
+                        value = text[..charBudget] + $"…（单值超长已截断，原始长度 {text.Length} 字符）";
+                        truncatedBySize = true;
+                    }
+
+                    row[names[i]] = value;
                 }
 
+                // 字符预算闸门：至少保留一行（否则结果无意义），其后超预算即按体积截断
+                var rowSize = MeasureRowChars(row);
+                if (rows.Count > 0 && charBudget > 0 && rowChars + rowSize > charBudget)
+                {
+                    truncated = true;
+                    truncatedBySize = true;
+                    break;
+                }
+
+                rowChars += rowSize;
                 rows.Add(row);
             }
         }
@@ -306,8 +456,15 @@ public class DatabaseService
             throw new McpException(provider.TranslateError(ex, database), ex);
         }
 
-        return new QueryResult(rows, truncated, columnCount, names);
+        return new QueryResult(rows, truncated, columnCount, names, skipped, truncatedBySize, offset);
     }
+
+    /// <summary>
+    /// 一行的实际 JSON 字符数（含转义：引号/控制字符会被转义成 2–6 倍，按原始长度估算会显著低估预算）。
+    /// 行已物化，多序列化一次换取预算准确，代价可接受。
+    /// </summary>
+    private static int MeasureRowChars(Dictionary<string, object?> row) =>
+        JsonSerializer.Serialize(row, SerializerOptions).Length;
 
     /// <summary>
     /// 在显式事务中执行写语句（INSERT/UPDATE/DELETE/DDL）。

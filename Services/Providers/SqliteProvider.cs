@@ -19,6 +19,8 @@ public sealed class SqliteProvider : IDatabaseProvider
 
     public bool SupportsTransactionalDdl => true;
 
+    public bool SupportsStoredProcedures => false;
+
     // SQLite 无账号/角色体系，ATTACH/PRAGMA 等已被语句分类为 Other 拒绝
     public IReadOnlyList<string> ExtraDangerousKeywords => Array.Empty<string>();
 

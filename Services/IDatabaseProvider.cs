@@ -35,6 +35,13 @@ public interface IDatabaseProvider
     /// </summary>
     bool SupportsTransactionalDdl { get; }
 
+    /// <summary>
+    /// 是否支持存储过程/函数目录查询。
+    /// SQLite 无此概念（返回空结果集），工具层据此输出 <c>supported:false</c> 而非空数组，
+    /// 让调用方能区分「该方言不支持」与「确实没有对象」。
+    /// </summary>
+    bool SupportsStoredProcedures { get; }
+
     /// <summary>该数据库类型的附加危险关键词（与全局黑名单合并后校验），无则返回空列表。</summary>
     IReadOnlyList<string> ExtraDangerousKeywords { get; }
 

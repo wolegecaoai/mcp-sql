@@ -1,5 +1,8 @@
 bin/
 obj/
+
+# 临时构建输出目录（bin-test / bin-verify-unit 等，见 AGENTS.md 的构建锁绕行方式）
+bin-*/
 *.user
 *.suo
 .vs/

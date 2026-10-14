@@ -10,7 +10,7 @@
 dotnet build                              # 构建（无 .sln，根目录直接构建主项目）
 dotnet build -o bin-test                  # 构建到独立目录；被运行中实例锁住 bin/ 时用这个
 dotnet run --no-build                     # 运行；必须加 --no-build，避免构建输出污染 stdio 通道
-dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（296 项；集成测试被默认过滤器排除，见下）
+dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（333 项；集成测试被默认过滤器排除，见下）
 dotnet publish -c Release -o publish      # 发布快照；publish/ 不是热更新，改代码/配置后必须重新 publish
 ```
 
@@ -47,6 +47,7 @@ Services/
   DatabaseProviderFactory.cs  # 按 Type 字符串创建 Provider（大小写不敏感，缺省 sqlserver）
   TableNameParser.cs          # 引号标识符感知的表名解析（四 Provider 共用）
   ExportFormatter.cs          # CSV / Markdown / JSON 导出纯函数（含公式注入防护）
+  ResponseFormatter.cs        # 查询/目录类工具的统一输出（envelope / compact / rows 三形态）
   AuditLogger.cs              # 审计日志：写入 + 查询（QueryEntries）+ 保留清理（PruneOldFiles）
   StartupDiagnostics.cs       # 启动自检：配置校验（纯函数）+ 可选连通性预检，只告警不阻断
   Providers/*.cs              # 四种数据库方言实现（唯一生成方言 SQL 的地方）
@@ -82,6 +83,9 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 - **`appsettings.json` 已被 `.gitignore` 排除**（含真实连接密码），`bin/`、`publish/` 中的副本同样含密码。**不要**提交它，也不要用模板覆盖用户现有配置。其中 `OnlineQuotationSystem` 的库名连接串里含零宽字符 U+200C，是刻意保留的（真实库名如此），编辑时勿"清理"。
 - **`nuget.config` 必须保留**：`<clear />` 锁定 nuget.org，因为本机全局 NuGet 配置存在不可达源会导致还原失败。
 - **新增数据库类型**：实现 `IDatabaseProvider`（`SupportsWrite` / `SupportsTransactionalDdl` / `ExtraDangerousKeywords` / `RoutineCreationPattern` / `BuildServerVersionSql` 五项能力 + 目录查询）→ 在 `DatabaseProviderFactory` 注册 → 更新 README 与 `ProviderTests`。
+- **输出必须是合法 JSON（AI 调用方契约）**：查询/目录类工具统一走 `ResponseFormatter`——元数据、截断提示（`notice`）、分页续取（`next.offset`）都在 JSON 信封内。**绝不要再把提示文本拼在 JSON 之后**（历史实现这么做，导致调用方 `JSON.parse` 必然失败）。`response_format` 三形态：`envelope`（默认）/`compact`（列名只出现一次，宽表省约一半 token）/`rows`（历史裸数组，仅为兼容）。
+- **`DatabaseService.GetProvider` 按别名、`GetProviderByType` 按类型**：前者传类型会因"不是别名"抛错（`list_databases` 富化时踩过）。两者语义不同，别混用。
+- **响应有两道闸**：行数（工具参数 `maxRows`，上限 5000）+ 字符预算（配置 `MaxResponseChars`，默认 60000）。判断截断原因看 `QueryResult.TruncatedBySize`（提示文案因此不同）。
 - **`MaxRows` 已移除**：曾是无代码读取的死配置，已从 `SqlServerOptions` 删除（三期的 `ExampleConfigContractTests` 会断言示例模板里不再出现它）。行数由各工具的 `maxRows` 参数控制（默认 100，Clamp 到 1–5000）。
 - **测试默认排除集成测试**：测试 csproj 里设了 `<VSTestTestCaseFilter>Category!=Integration</VSTestTestCaseFilter>`，因此裸 `dotnet test` 永远零依赖可跑；CI 的集成 job 用显式 `--filter "Category=Integration"` **覆盖**该默认值（已验证覆盖生效）。改这个属性时务必确认两个方向都对。
 - **启动自检只告警不阻断**：`StartupDiagnostics.RunAsync` 在 `host.RunAsync()` 之前执行，配置问题只输出 stderr 警告。**不要**把它改成"有问题就退出"——stdio 服务启动即退出会让客户端侧完全拿不到诊断信息。配置文件的 `AddJsonFile` 是 `optional: true`，缺失时同样走警告路径而不是抛异常。

@@ -16,6 +16,8 @@ public sealed class PostgreSqlProvider : IDatabaseProvider
 
     public bool SupportsTransactionalDdl => true;
 
+    public bool SupportsStoredProcedures => true;
+
     // PG 角色与系统级设置语句（全局黑名单的 CREATE LOGIN 等不覆盖 PG 方言）
     public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
     {
