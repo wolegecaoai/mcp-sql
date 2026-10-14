@@ -219,11 +219,120 @@ public class ProviderTests
     }
 
     [Fact]
-    public void 新库默认只读()
+    public void Phase2起四类库均支持写操作()
     {
         Assert.True(_factory.GetProvider("sqlserver").SupportsWrite);
-        Assert.False(_factory.GetProvider("mysql").SupportsWrite);
-        Assert.False(_factory.GetProvider("postgresql").SupportsWrite);
-        Assert.False(_factory.GetProvider("sqlite").SupportsWrite);
+        Assert.True(_factory.GetProvider("mysql").SupportsWrite);
+        Assert.True(_factory.GetProvider("postgresql").SupportsWrite);
+        Assert.True(_factory.GetProvider("sqlite").SupportsWrite);
+    }
+
+    [Theory]
+    [InlineData("sqlserver", true)]
+    [InlineData("mysql", false)]      // InnoDB DDL 隐式提交，不可演练
+    [InlineData("postgresql", true)]
+    [InlineData("sqlite", true)]
+    public void SupportsTransactionalDdl_按方言区分(string providerId, bool expected)
+    {
+        Assert.Equal(expected, _factory.GetProvider(providerId).SupportsTransactionalDdl);
+    }
+
+    [Fact]
+    public void MySqlProvider_附加黑名单覆盖账号与服务器级语句()
+    {
+        var extras = new MySqlProvider().ExtraDangerousKeywords;
+        Assert.Contains("CREATE USER", extras);
+        Assert.Contains("DROP USER", extras);
+        Assert.Contains("SET GLOBAL", extras);
+        Assert.Contains("FLUSH", extras);
+        Assert.DoesNotContain("CREATE LOGIN", extras); // 全局黑名单已覆盖，不重复
+    }
+
+    [Fact]
+    public void PostgreSqlProvider_附加黑名单覆盖角色与系统级语句()
+    {
+        var extras = new PostgreSqlProvider().ExtraDangerousKeywords;
+        Assert.Contains("CREATE ROLE", extras);
+        Assert.Contains("ALTER ROLE", extras);
+        Assert.Contains("ALTER SYSTEM", extras);
+    }
+
+    [Fact]
+    public void 四库均声明例程创建拦截规则()
+    {
+        // C2/CR-1：例程类语句改用正则规则（覆盖 CREATE OR ALTER / ALTER 等变体），
+        // 端到端行为由 RoutineCreationPatternTests 验证
+        foreach (var providerId in new[] { "sqlserver", "mysql", "postgresql", "sqlite" })
+        {
+            Assert.False(string.IsNullOrWhiteSpace(_factory.GetProvider(providerId).RoutineCreationPattern));
+        }
+    }
+
+    [Theory]
+    [InlineData("sqlserver", "@@VERSION")]
+    [InlineData("mysql", "VERSION()")]
+    [InlineData("postgresql", "server_version")]
+    [InlineData("sqlite", "sqlite_version()")]
+    public void BuildServerVersionSql_输出归一化列名(string providerId, string expectedFragment)
+    {
+        var sql = _factory.GetProvider(providerId).BuildServerVersionSql();
+        Assert.Contains(expectedFragment, sql);
+        Assert.Contains("server_version", sql);
+        Assert.Contains("current_database", sql);
+    }
+
+    // ---------- 带引号标识符表名（M10） ----------
+
+    [Theory]
+    [InlineData("[my.table]", "dbo", "my.table")]        // 方括号包裹，点不切分
+    [InlineData("dbo.[my.table]", "dbo", "my.table")]    // 混合形式
+    [InlineData("[dbo].[my.table]", "dbo", "my.table")]
+    public void SqlServerProvider_引号表名不再误切(string table, string expectedSchema, string expectedTable)
+    {
+        var provider = new SqlServerProvider();
+        var (schema, name) = provider.SplitTableName(table);
+        Assert.Equal(expectedSchema, schema);
+        Assert.Equal(expectedTable, name);
+    }
+
+    [Theory]
+    [InlineData("\"my.table\"", "public", "my.table")]
+    [InlineData("public.\"my.table\"", "public", "my.table")]
+    public void PostgreSqlProvider_引号表名不再误切(string table, string expectedSchema, string expectedTable)
+    {
+        var provider = new PostgreSqlProvider();
+        var (schema, name) = provider.SplitTableName(table);
+        Assert.Equal(expectedSchema, schema);
+        Assert.Equal(expectedTable, name);
+    }
+
+    [Theory]
+    [InlineData("`my.table`", "", "my.table")]
+    [InlineData("mydb.`my.table`", "mydb", "my.table")]
+    public void MySqlProvider_反引号表名不再误切(string table, string expectedSchema, string expectedTable)
+    {
+        var provider = new MySqlProvider();
+        var (schema, name) = provider.SplitTableName(table);
+        Assert.Equal(expectedSchema, schema);
+        Assert.Equal(expectedTable, name);
+    }
+
+    [Theory]
+    [InlineData("Weather")]
+    [InlineData("main.Weather")]
+    [InlineData("\"my.table\"")]
+    public void SqliteProvider_引号与普通表名解析(string table)
+    {
+        var (schema, name) = new SqliteProvider().SplitTableName(table);
+        Assert.False(string.IsNullOrWhiteSpace(name));
+    }
+
+    [Theory]
+    [InlineData("a.b.c")]          // 三段裸写
+    [InlineData("[unclosed")]      // 引号未闭合
+    [InlineData("dbo.")]           // 空片段
+    public void SplitTableName_非法表名拒绝(string table)
+    {
+        Assert.Throws<McpException>(() => new SqlServerProvider().SplitTableName(table));
     }
 }

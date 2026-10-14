@@ -26,8 +26,27 @@ public interface IDatabaseProvider
     /// <summary>中文显示名（错误提示与列表展示使用），如 "SQL Server"、"MySQL"。</summary>
     string DisplayName { get; }
 
-    /// <summary>是否支持写操作（execute_non_query / execute_ddl）。只读优先阶段仅 SQL Server 为 true。</summary>
+    /// <summary>是否支持写操作（execute_non_query / execute_ddl）。Phase 1 仅 SQL Server 为 true，二期起四类库均为 true。</summary>
     bool SupportsWrite { get; }
+
+    /// <summary>
+    /// DDL 是否可事务化（决定 execute_ddl 演练模式是否可用）。
+    /// MySQL InnoDB 的 DDL 会隐式提交、无法回滚，为 false；SQL Server / PostgreSQL / SQLite 为 true。
+    /// </summary>
+    bool SupportsTransactionalDdl { get; }
+
+    /// <summary>该数据库类型的附加危险关键词（与全局黑名单合并后校验），无则返回空列表。</summary>
+    IReadOnlyList<string> ExtraDangerousKeywords { get; }
+
+    /// <summary>
+    /// 例程/触发器/程序集等"语句体可藏匿危险词"的创建/修改语句的正则（CR-1），为 null 表示无此规则。
+    /// 必须覆盖方言的全部语法变体（CREATE OR ALTER / CREATE OR REPLACE / ALTER / TEMP 等），
+    /// 因为固定短语匹配会被修饰词绕过。
+    /// </summary>
+    string? RoutineCreationPattern { get; }
+
+    /// <summary>服务器版本 / 当前库探测 SQL（输出列名归一化为 server_version, current_database）。</summary>
+    string BuildServerVersionSql();
 
     /// <summary>按连接字符串创建连接对象（尚未打开，调用方负责打开与释放）。</summary>
     DbConnection CreateConnection(string connectionString);

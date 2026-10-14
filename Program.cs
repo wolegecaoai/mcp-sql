@@ -28,6 +28,11 @@ builder.Services.AddSingleton<DatabaseProviderFactory>();
 builder.Services.AddSingleton<DatabaseService>();
 builder.Services.AddSingleton<SqlGuardService>();
 
+// 审计日志：日志目录挂在配置目录下（logs/audit-YYYYMMDD.log）
+builder.Services.AddSingleton(serviceProvider => new AuditLogger(
+    configDirectory,
+    serviceProvider.GetRequiredService<ILogger<AuditLogger>>()));
+
 // MCP Server：stdio 本地传输，注册工具类型
 builder.Services
     .AddMcpServer()

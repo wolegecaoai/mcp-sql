@@ -14,7 +14,21 @@ public sealed class SqliteProvider : IDatabaseProvider
 
     public string DisplayName => "SQLite";
 
-    public bool SupportsWrite => false;
+    // Phase 2 起开放写能力；SQLite 的 DDL 可事务化，演练回滚可用
+    public bool SupportsWrite => true;
+
+    public bool SupportsTransactionalDdl => true;
+
+    // SQLite 无账号/角色体系，ATTACH/PRAGMA 等已被语句分类为 Other 拒绝
+    public IReadOnlyList<string> ExtraDangerousKeywords => Array.Empty<string>();
+
+    // 触发器体可藏危险词（C2）；正则覆盖 CREATE TRIGGER / CREATE TEMP[ORARY] TRIGGER
+    public string? RoutineCreationPattern =>
+        @"\bCREATE\s+(TEMP\s+|TEMPORARY\s+)?TRIGGER\b";
+
+    public string BuildServerVersionSql() => """
+        SELECT sqlite_version() AS server_version, 'main' AS current_database
+        """;
 
     public DbConnection CreateConnection(string connectionString) => new SqliteConnection(connectionString);
 
@@ -23,18 +37,8 @@ public sealed class SqliteProvider : IDatabaseProvider
 
     public (string Schema, string Table) SplitTableName(string table)
     {
-        if (string.IsNullOrWhiteSpace(table))
-        {
-            throw new McpException("表名不能为空。");
-        }
-
-        var parts = table.Split('.', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length switch
-        {
-            1 => ("main", parts[0]),
-            2 => (parts[0], parts[1]),
-            _ => throw new McpException($"表名格式不正确：{table}。请使用 \"表名\" 或 \"库名.表名\"。")
-        };
+        var (schema, name) = TableNameParser.Parse(table);
+        return (schema ?? "main", name);
     }
 
     public string TranslateError(Exception ex, string database) => ex switch
@@ -45,6 +49,8 @@ public sealed class SqliteProvider : IDatabaseProvider
             $"数据库「{database}」操作失败（SQLite 错误 {sqliteEx.SqliteErrorCode}）：{sqliteEx.Message}",
         TimeoutException =>
             $"数据库「{database}」操作超时。请检查磁盘与服务器负载，或适当增大 CommandTimeoutSeconds。",
+        ArgumentException or FormatException or NotSupportedException =>
+            $"数据库「{database}」连接字符串格式无效或不受支持，请检查 Type 与连接字符串是否匹配。",
         _ => $"数据库「{database}」操作失败：{ex.Message}"
     };
 

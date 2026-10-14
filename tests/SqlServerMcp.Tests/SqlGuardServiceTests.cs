@@ -94,6 +94,20 @@ public class SqlGuardServiceTests
     }
 
     [Fact]
+    public void AssertReadOnly_报错文案使用传入的工具名()
+    {
+        // I5：export_query_result 等工具不应看到硬编码的 execute_query 提示
+        var ex = Assert.Throws<McpException>(() =>
+            _guard.AssertReadOnly("DELETE FROM t", NoKeywords, "export_query_result"));
+        Assert.Contains("export_query_result", ex.Message);
+        Assert.DoesNotContain("execute_query", ex.Message);
+
+        var intoEx = Assert.Throws<McpException>(() =>
+            _guard.AssertReadOnly("SELECT * INTO t2 FROM t", NoKeywords, "export_query_result"));
+        Assert.Contains("export_query_result", intoEx.Message);
+    }
+
+    [Fact]
     public void AssertReadOnly_黑名单在只读路径生效()
     {
         // I1：SELECT 也可通过链接服务器/文件函数外发数据

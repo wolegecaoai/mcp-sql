@@ -27,8 +27,8 @@ public sealed class DatabaseProviderFactory
         }
     }
 
-    /// <summary>所有支持的数据库类型标识。</summary>
-    public IReadOnlyCollection<string> SupportedTypes => _providers.Keys;
+    /// <summary>所有支持的数据库类型标识（不可变快照，避免暴露活视图）。</summary>
+    public IReadOnlyCollection<string> SupportedTypes => _providers.Keys.ToList();
 
     /// <summary>按类型标识获取 Provider；type 为空时缺省为 sqlserver（保证旧配置兼容）。</summary>
     public IDatabaseProvider GetProvider(string? type)

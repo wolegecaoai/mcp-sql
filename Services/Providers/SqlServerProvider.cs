@@ -13,6 +13,24 @@ public sealed class SqlServerProvider : IDatabaseProvider
 
     public bool SupportsWrite => true;
 
+    public bool SupportsTransactionalDdl => true;
+
+    // SQL Server 附加黑名单：非例程类的方言专属危险语句
+    public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
+    {
+        "sp_addlinkedserver",
+        "sp_addlinkedsrvlogin"
+    };
+
+    // 例程/程序集/端点等（C2）：语句体可藏危险词、CLR 程序集与扩展过程可提权至服务账户。
+    // 用正则覆盖修饰词变体：CREATE PROCEDURE / CREATE OR ALTER PROCEDURE / ALTER PROCEDURE / CREATE PROC …
+    public string? RoutineCreationPattern =>
+        @"\b(CREATE(\s+OR\s+ALTER)?|ALTER)\s+(PROCEDURE|PROC|FUNCTION|TRIGGER|ASSEMBLY|AGGREGATE|CREDENTIAL|ENDPOINT)\b";
+
+    public string BuildServerVersionSql() => """
+        SELECT @@VERSION AS server_version, DB_NAME() AS current_database
+        """;
+
     public DbConnection CreateConnection(string connectionString) => new SqlConnection(connectionString);
 
     public string QuoteIdentifier(string identifier) =>
@@ -20,18 +38,8 @@ public sealed class SqlServerProvider : IDatabaseProvider
 
     public (string Schema, string Table) SplitTableName(string table)
     {
-        if (string.IsNullOrWhiteSpace(table))
-        {
-            throw new McpException("表名不能为空。");
-        }
-
-        var parts = table.Split('.', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length switch
-        {
-            1 => ("dbo", parts[0]),
-            2 => (parts[0], parts[1]),
-            _ => throw new McpException($"表名格式不正确：{table}。请使用 \"表名\" 或 \"schema.表名\"。")
-        };
+        var (schema, name) = TableNameParser.Parse(table);
+        return (schema ?? "dbo", name);
     }
 
     public string TranslateError(Exception ex, string database) => ex switch
@@ -54,6 +62,8 @@ public sealed class SqlServerProvider : IDatabaseProvider
         },
         TimeoutException =>
             $"数据库「{database}」操作超时。请检查网络与服务器负载，或适当增大 CommandTimeoutSeconds。",
+        ArgumentException or FormatException or NotSupportedException =>
+            $"数据库「{database}」连接字符串格式无效或不受支持，请检查 Type 与连接字符串是否匹配。",
         _ => $"数据库「{database}」操作失败：{ex.Message}"
     };
 
@@ -152,13 +162,13 @@ public sealed class SqlServerProvider : IDatabaseProvider
                           JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
                           WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 0
                           ORDER BY ic.key_ordinal
-                          FOR XML PATH('')), 1, 2, '') AS key_columns,
+                          FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, '') AS key_columns,
                    STUFF((SELECT ', ' + c.name
                           FROM sys.index_columns ic
                           JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
                           WHERE ic.object_id = i.object_id AND ic.index_id = i.index_id AND ic.is_included_column = 1
                           ORDER BY ic.index_column_id
-                          FOR XML PATH('')), 1, 2, '') AS included_columns
+                          FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, '') AS included_columns
             FROM sys.indexes i
             JOIN sys.tables t ON t.object_id = i.object_id
             JOIN sys.schemas s ON s.schema_id = t.schema_id

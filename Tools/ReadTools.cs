@@ -1,9 +1,7 @@
 using System.ComponentModel;
 using System.Text.Json;
-using Microsoft.Extensions.Options;
 using ModelContextProtocol;
 using ModelContextProtocol.Server;
-using SqlServerMcp.Configuration;
 using SqlServerMcp.Services;
 
 namespace SqlServerMcp.Tools;
@@ -79,7 +77,7 @@ public class ReadTools
     }
 
     [McpServerTool(Name = "list_indexes", ReadOnly = true, Idempotent = true)]
-    [Description("列出指定数据库的索引（可按表名过滤），含索引类型、是否唯一、键列与包含列。")]
+    [Description("列出指定数据库的索引（可按表名过滤），含索引类型、是否唯一、键列与包含列。注意：MySQL 的键列拼接受 group_concat_max_len（默认 1024 字符）限制，超长索引列表可能被截断。")]
     public static async Task<string> ListIndexesAsync(
         DatabaseService databaseService,
         [Description("目标数据库别名（必须是已授权库）")] string database,
@@ -129,17 +127,98 @@ public class ReadTools
     [Description("在指定数据库上执行只读 SELECT 查询（支持 WITH CTE）。仅允许单条查询语句，返回 JSON 数组结果。")]
     public static async Task<string> ExecuteQueryAsync(
         DatabaseService databaseService,
-        SqlGuardService sqlGuardService,
-        IOptions<SqlServerOptions> options,
+        AuditLogger auditLogger,
         [Description("目标数据库别名（必须是已授权库）")] string database,
         [Description("要执行的 SELECT 语句（仅单条）")] string sql,
         [Description("最大返回行数，默认 100，上限 5000")] int maxRows = 100,
         CancellationToken ct = default)
     {
-        sqlGuardService.AssertReadOnly(sql, options.Value.DangerousKeywords);
+        // 只读守卫已下沉至 DatabaseService.ExecuteReadOnlyQueryAsync（M12）：单语句/分类/INTO/黑名单自动生效
         var limit = Math.Clamp(maxRows, 1, 5000);
-        var result = await databaseService.ExecuteQueryAsync(database, sql, limit, ct: ct);
+        var result = await ExecuteGuardedReadAsync(databaseService, auditLogger, database, "execute_query", sql, limit, ct);
         return result.ToJson() + TruncationNotice(result, limit);
+    }
+
+    [McpServerTool(Name = "test_connection", ReadOnly = true, Idempotent = true)]
+    [Description("测试指定数据库的连通性，返回 Provider 类型、服务器版本、当前库名与连接耗时（毫秒）。")]
+    public static async Task<string> TestConnectionAsync(
+        DatabaseService databaseService,
+        [Description("目标数据库别名（必须是已授权库，可通过 list_databases 查看）")] string database,
+        CancellationToken ct = default)
+    {
+        var provider = databaseService.GetProvider(database);
+
+        var startedAt = System.Diagnostics.Stopwatch.StartNew();
+        var result = await databaseService.ExecuteQueryAsync(database, provider.BuildServerVersionSql(), maxRows: 1, ct: ct);
+        startedAt.Stop();
+
+        var row = result.Rows.Count > 0 ? result.Rows[0] : new Dictionary<string, object?>();
+        var payload = new
+        {
+            database,
+            provider = provider.ProviderId,
+            display_name = provider.DisplayName,
+            connected = true,
+            latency_ms = startedAt.ElapsedMilliseconds,
+            server_version = row.TryGetValue("server_version", out var version) ? version : null,
+            current_database = row.TryGetValue("current_database", out var current) ? current : null
+        };
+
+        return JsonSerializer.Serialize(payload, DatabaseService.SerializerOptions);
+    }
+
+    [McpServerTool(Name = "export_query_result", ReadOnly = true, Idempotent = true)]
+    [Description("执行只读 SELECT 查询（支持 WITH CTE）并将结果导出为指定格式。仅允许单条查询语句，只读守卫与黑名单自动生效。")]
+    public static async Task<string> ExportQueryResultAsync(
+        DatabaseService databaseService,
+        AuditLogger auditLogger,
+        [Description("目标数据库别名（必须是已授权库）")] string database,
+        [Description("要执行的 SELECT 语句（仅单条）")] string sql,
+        [Description("导出格式：csv（默认）/ markdown / json")] string format = "csv",
+        [Description("最大导出行数，默认 100，上限 5000")] int maxRows = 100,
+        CancellationToken ct = default)
+    {
+        var limit = Math.Clamp(maxRows, 1, 5000);
+        var result = await ExecuteGuardedReadAsync(databaseService, auditLogger, database, "export_query_result", sql, limit, ct);
+
+        var normalizedFormat = format.Trim().ToLowerInvariant();
+        var content = normalizedFormat switch
+        {
+            "csv" => ExportFormatter.ToCsv(result),
+            "markdown" or "md" => ExportFormatter.ToMarkdown(result),
+            "json" => ExportFormatter.ToJson(result),
+            _ => throw new McpException($"不支持的导出格式「{format}」。支持的格式：csv、markdown、json。")
+        };
+
+        // CSV/JSON 保持机器可读纯净（截断提示会污染数据本身），提示仅附加于 Markdown（M3）
+        var notice = normalizedFormat is "markdown" or "md" ? TruncationNotice(result, limit) : string.Empty;
+        return content + notice;
+    }
+
+    /// <summary>
+    /// 先做只读守卫校验（拒绝则记审计后抛出），再执行查询。
+    /// 守卫与执行分离是为了避免把连接/查询失败误标为"守卫拒绝"（MI-2）。
+    /// </summary>
+    private static async Task<QueryResult> ExecuteGuardedReadAsync(
+        DatabaseService databaseService,
+        AuditLogger auditLogger,
+        string database,
+        string tool,
+        string sql,
+        int limit,
+        CancellationToken ct)
+    {
+        try
+        {
+            databaseService.AssertReadOnlyQuery(database, sql, tool);
+        }
+        catch (McpException ex)
+        {
+            auditLogger.LogGuardRejected(database, tool, ex.Message, sql);
+            throw;
+        }
+
+        return await databaseService.ExecuteQueryAsync(database, sql, limit, ct: ct);
     }
 
     private static string TruncationNotice(QueryResult result, int limit) =>

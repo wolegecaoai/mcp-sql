@@ -11,7 +11,32 @@ public sealed class MySqlProvider : IDatabaseProvider
 
     public string DisplayName => "MySQL";
 
-    public bool SupportsWrite => false;
+    // Phase 2 起开放写能力；InnoDB 的 DDL 会隐式提交，演练回滚不可用
+    public bool SupportsWrite => true;
+
+    public bool SupportsTransactionalDdl => false;
+
+    // MySQL 账号与服务器级设置语句（全局黑名单的 CREATE LOGIN 等不覆盖 MySQL 方言）
+    public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
+    {
+        "CREATE USER",
+        "DROP USER",
+        "RENAME USER",
+        "ALTER USER",
+        "SET PASSWORD",
+        "SET GLOBAL",
+        "FLUSH",
+        "CREATE DEFINER"
+    };
+
+    // 例程/触发器/事件（C2）：函数体可藏危险词，UDF SONAME 可提权至服务账户；
+    // 正则覆盖 CREATE / CREATE OR REPLACE / ALTER 变体
+    public string? RoutineCreationPattern =>
+        @"\b(CREATE(\s+OR\s+REPLACE)?|ALTER)\s+(PROCEDURE|FUNCTION|TRIGGER|EVENT)\b";
+
+    public string BuildServerVersionSql() => """
+        SELECT VERSION() AS server_version, DATABASE() AS current_database
+        """;
 
     public DbConnection CreateConnection(string connectionString) => new MySqlConnection(connectionString);
 
@@ -21,18 +46,8 @@ public sealed class MySqlProvider : IDatabaseProvider
     /// <summary>MySQL 的 schema 即数据库名：仅传表名时用连接串的当前库（目录 SQL 中以 DATABASE() 表示）。</summary>
     public (string Schema, string Table) SplitTableName(string table)
     {
-        if (string.IsNullOrWhiteSpace(table))
-        {
-            throw new McpException("表名不能为空。");
-        }
-
-        var parts = table.Split('.', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length switch
-        {
-            1 => (string.Empty, parts[0]),
-            2 => (parts[0], parts[1]),
-            _ => throw new McpException($"表名格式不正确：{table}。请使用 \"表名\" 或 \"库名.表名\"。")
-        };
+        var (schema, name) = TableNameParser.Parse(table);
+        return (schema ?? string.Empty, name);
     }
 
     public string TranslateError(Exception ex, string database) => ex switch
@@ -50,6 +65,8 @@ public sealed class MySqlProvider : IDatabaseProvider
         },
         TimeoutException =>
             $"数据库「{database}」操作超时。请检查网络与服务器负载，或适当增大 CommandTimeoutSeconds。",
+        ArgumentException or FormatException or NotSupportedException =>
+            $"数据库「{database}」连接字符串格式无效或不受支持，请检查 Type 与连接字符串是否匹配。",
         _ => $"数据库「{database}」操作失败：{ex.Message}"
     };
 

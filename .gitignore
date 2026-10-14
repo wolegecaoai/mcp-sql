@@ -8,5 +8,8 @@ publish/
 # 含数据库连接字符串与密码，禁止提交到版本库
 appsettings.json
 
+# 审计日志（可能含 SQL 预览与库名）
+logs/
+
 # IDE 本地项目数据，不纳入版本库
 .codebuddy/

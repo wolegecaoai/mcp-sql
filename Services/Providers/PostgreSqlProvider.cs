@@ -11,7 +11,30 @@ public sealed class PostgreSqlProvider : IDatabaseProvider
 
     public string DisplayName => "PostgreSQL";
 
-    public bool SupportsWrite => false;
+    // Phase 2 起开放写能力；PG 的 DDL 可事务化，演练回滚可用
+    public bool SupportsWrite => true;
+
+    public bool SupportsTransactionalDdl => true;
+
+    // PG 角色与系统级设置语句（全局黑名单的 CREATE LOGIN 等不覆盖 PG 方言）
+    public IReadOnlyList<string> ExtraDangerousKeywords { get; } = new[]
+    {
+        "CREATE ROLE",
+        "DROP ROLE",
+        "ALTER ROLE",
+        "CREATE USER",
+        "DROP USER",
+        "ALTER SYSTEM"
+    };
+
+    // 例程/扩展/外部数据（C2）：函数体可藏危险词，LANGUAGE c 需 superuser 可提权；
+    // 正则覆盖 CREATE / CREATE OR REPLACE / ALTER 变体
+    public string? RoutineCreationPattern =>
+        @"\b(CREATE(\s+OR\s+REPLACE)?|ALTER)\s+(FUNCTION|PROCEDURE|TRIGGER|EVENT|EXTENSION|SERVER|USER\s+MAPPING|FOREIGN\s+(DATA\s+WRAPPER|TABLE)|LANGUAGE|PUBLICATION|SUBSCRIPTION)\b";
+
+    public string BuildServerVersionSql() => """
+        SELECT current_setting('server_version') AS server_version, current_database() AS current_database
+        """;
 
     public DbConnection CreateConnection(string connectionString) => new NpgsqlConnection(connectionString);
 
@@ -20,18 +43,8 @@ public sealed class PostgreSqlProvider : IDatabaseProvider
 
     public (string Schema, string Table) SplitTableName(string table)
     {
-        if (string.IsNullOrWhiteSpace(table))
-        {
-            throw new McpException("表名不能为空。");
-        }
-
-        var parts = table.Split('.', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        return parts.Length switch
-        {
-            1 => ("public", parts[0]),
-            2 => (parts[0], parts[1]),
-            _ => throw new McpException($"表名格式不正确：{table}。请使用 \"表名\" 或 \"schema.表名\"。")
-        };
+        var (schema, name) = TableNameParser.Parse(table);
+        return (schema ?? "public", name);
     }
 
     public string TranslateError(Exception ex, string database) => ex switch
@@ -55,6 +68,8 @@ public sealed class PostgreSqlProvider : IDatabaseProvider
         },
         TimeoutException =>
             $"数据库「{database}」操作超时。请检查网络与服务器负载，或适当增大 CommandTimeoutSeconds。",
+        ArgumentException or FormatException or NotSupportedException =>
+            $"数据库「{database}」连接字符串格式无效或不受支持，请检查 Type 与连接字符串是否匹配。",
         _ => $"数据库「{database}」操作失败：{ex.Message}"
     };
 

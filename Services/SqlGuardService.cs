@@ -149,14 +149,15 @@ public class SqlGuardService
     /// </summary>
     /// <param name="sql">待校验语句。</param>
     /// <param name="dangerousKeywords">危险关键词黑名单（只读侧同样生效，防数据外发/文件读取类函数）。</param>
-    public void AssertReadOnly(string sql, IEnumerable<string> dangerousKeywords)
+    /// <param name="toolName">发起校验的工具名（用于准确的报错文案，默认 execute_query）。</param>
+    public void AssertReadOnly(string sql, IEnumerable<string> dangerousKeywords, string toolName = "execute_query")
     {
-        AssertSingleStatement(sql, "execute_query");
+        AssertSingleStatement(sql, toolName);
         var type = ClassifyStatement(sql);
         if (type != SqlStatementType.Select)
         {
             throw new McpException(
-                $"execute_query 仅支持 SELECT/WITH 查询语句（检测到 {DescribeType(type)}）。" +
+                $"{toolName} 仅支持 SELECT/WITH 查询语句（检测到 {DescribeType(type)}）。" +
                 "数据修改请使用 execute_non_query，结构变更请使用 execute_ddl。");
         }
 
@@ -164,7 +165,7 @@ public class SqlGuardService
         if (Regex.IsMatch(StripCommentsAndStrings(sql), @"\bINTO\b", RegexOptions.IgnoreCase))
         {
             throw new McpException(
-                "execute_query 仅支持只读查询：检测到 SELECT ... INTO（会在查询过程中创建表并写入数据）。" +
+                $"{toolName} 仅支持只读查询：检测到 SELECT ... INTO（会在查询过程中创建表并写入数据）。" +
                 "数据修改请使用 execute_non_query，结构变更请使用 execute_ddl。");
         }
 
@@ -194,6 +195,31 @@ public class SqlGuardService
                     $"语句包含被禁止的危险关键词「{trimmed}」，已拒绝执行。" +
                     "如确需放行，请调整 appsettings.json 中 SqlServer:DangerousKeywords 配置。");
             }
+        }
+    }
+
+    /// <summary>
+    /// 校验语句不是"创建/修改例程、触发器、程序集"类（C2/CR-1）：
+    /// 这类语句的**语句体**（函数体/触发器体）可藏匿黑名单看不见的危险关键字，
+    /// 且 CLR 程序集 / UDF / LANGUAGE c 可提权至数据库服务账户，故整体拒绝。
+    /// 用方言正则匹配而非固定短语，覆盖 CREATE OR ALTER / CREATE OR REPLACE / ALTER / TEMP 等变体。
+    /// </summary>
+    /// <param name="routinePattern">方言正则（为 null/空表示该方言无此规则）。</param>
+    /// <param name="providerName">方言显示名（报错文案使用）。</param>
+    public void AssertNoRoutineCreation(string sql, string? routinePattern, string providerName)
+    {
+        if (string.IsNullOrWhiteSpace(routinePattern))
+        {
+            return;
+        }
+
+        var cleaned = StripCommentsAndStrings(sql);
+        if (Regex.IsMatch(cleaned, routinePattern, RegexOptions.IgnoreCase))
+        {
+            throw new McpException(
+                $"检测到创建/修改例程、触发器或程序集类语句（{providerName}）。" +
+                "此类语句的语句体无法被关键词黑名单检查，且可能提权至数据库服务账户，已拒绝执行。" +
+                "如确需，请由 DBA 直接在数据库端执行。");
         }
     }
 
@@ -455,7 +481,8 @@ public class SqlGuardService
         return builder.ToString();
     }
 
-    private static string DescribeType(SqlStatementType type) => type switch
+    /// <summary>语句类型的中文描述（供工具层组装可操作错误文案）。</summary>
+    public static string DescribeType(SqlStatementType type) => type switch
     {
         SqlStatementType.Select => "SELECT 查询",
         SqlStatementType.Insert => "INSERT 写入",
