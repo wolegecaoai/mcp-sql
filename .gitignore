@@ -14,6 +14,11 @@ out/
 # 含数据库连接字符串与密码，禁止提交到版本库
 appsettings.json
 
+# appsettings 的各种副本/备份（如「appsettings - 副本.json」）同样含真实凭据，一律忽略；
+# 例外保留可提交的示例模板（否决规则须排在通配规则之后）
+appsettings*.json
+!appsettings.example.json
+
 # 审计日志（可能含 SQL 预览与库名）
 logs/
 
