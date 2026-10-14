@@ -1,0 +1,12 @@
+bin/
+obj/
+*.user
+*.suo
+.vs/
+publish/
+
+# 含数据库连接字符串与密码，禁止提交到版本库
+appsettings.json
+
+# IDE 本地项目数据，不纳入版本库
+.codebuddy/
