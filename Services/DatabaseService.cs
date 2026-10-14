@@ -353,7 +353,7 @@ public class DatabaseService
             }
 
             // 翻译为中文后做密码脱敏，避免凭据随错误文案回显给调用方（4.6）
-            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), SecretRedactor.SanitizeException(ex));
         }
     }
 
@@ -507,7 +507,7 @@ public class DatabaseService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // 翻译为中文后做密码脱敏，避免凭据随错误文案回显给调用方 / 审计日志（4.6）
-            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), SecretRedactor.SanitizeException(ex));
         }
 
         return new QueryResult(rows, truncated, columnCount, names, skipped, truncatedBySize, offset);
@@ -610,7 +610,7 @@ public class DatabaseService
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
-                throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
+                throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), SecretRedactor.SanitizeException(ex));
             }
         }
 
@@ -623,7 +623,7 @@ public class DatabaseService
         catch (Exception ex) when (ex is not OperationCanceledException)
         {
             _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
-            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), SecretRedactor.SanitizeException(ex));
         }
 
         await using var __ = transaction;
@@ -666,7 +666,7 @@ public class DatabaseService
             }
 
             _auditLogger.LogWriteFailed(database, provider.ProviderId, "execute_write", SecretRedactor.Redact(ex.Message), sql);
-            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), ex);
+            throw new McpException(SecretRedactor.Redact(provider.TranslateError(ex, database)), SecretRedactor.SanitizeException(ex));
         }
     }
 

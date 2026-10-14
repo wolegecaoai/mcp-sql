@@ -44,4 +44,30 @@ public class SecretRedactorTests
         Assert.Equal(string.Empty, SecretRedactor.Redact(null));
         Assert.Equal("abc", SecretRedactor.Redact("abc"));
     }
+
+    [Fact]
+    public void SanitizeException_无敏感信息时原样返回保留堆栈()
+    {
+        var original = new InvalidOperationException("boom");
+        var result = SecretRedactor.SanitizeException(original);
+        Assert.Same(original, result);
+    }
+
+    [Fact]
+    public void SanitizeException_命中密码模式时脱敏且不泄露明文()
+    {
+        var original = new InvalidOperationException("连接失败：Server=x;Password=SuperSecret123;Database=db");
+        var result = SecretRedactor.SanitizeException(original);
+
+        Assert.NotSame(original, result);
+        Assert.NotNull(result);
+        Assert.DoesNotContain("SuperSecret123", result!.ToString());
+        Assert.Contains("Password=****", result.ToString());
+    }
+
+    [Fact]
+    public void SanitizeException_null安全()
+    {
+        Assert.Null(SecretRedactor.SanitizeException(null));
+    }
 }

@@ -26,4 +26,27 @@ public static class SecretRedactor
 
         return PasswordRegex.Replace(input, match => $"{match.Groups[1].Value}=****");
     }
+
+    /// <summary>
+    /// 对异常做脱敏（M1）：MCP SDK 会把工具内未捕获异常的完整链条按 Error 级落到 stderr，
+    /// 若驱动的原始异常消息含连接串则会泄露。这里检测整个异常的字符串形式：
+    /// 无敏感信息时**原样返回**（保留类型与堆栈，不影响排障）；命中密码模式时才替换为脱敏后的包装异常。
+    /// </summary>
+    public static Exception? SanitizeException(Exception? exception)
+    {
+        if (exception is null)
+        {
+            return null;
+        }
+
+        var full = exception.ToString();
+        var redacted = Redact(full);
+        if (string.Equals(full, redacted, StringComparison.Ordinal))
+        {
+            return exception;
+        }
+
+        return new InvalidOperationException(
+            $"[已脱敏的异常，原始类型 {exception.GetType().FullName}]{Environment.NewLine}{redacted}");
+    }
 }

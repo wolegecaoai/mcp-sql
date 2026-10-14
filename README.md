@@ -11,7 +11,7 @@
 - **写操作二次确认**：`confirm=false`（默认）进入**演练模式**——语句在事务中执行后回滚，返回预估影响行数（MySQL 的 DDL 会隐式提交、无法回滚，故演练时跳过执行并提示）；确认无误后 `confirm=true` 才真正提交。
 - **安全防护**：危险关键词黑名单（`DROP DATABASE`、`CREATE LOGIN`、`GRANT` 等实例级与提权语句，以及各数据库方言的例程/触发器/程序集创建语句，可配置）、`execute_query` 只读加固（穿透 CTE 识别主语句类型，拦截 `WITH ... INSERT/UPDATE/DELETE` 与 `SELECT ... INTO`）、守卫下沉到服务层（查询/写入的唯一入口内置校验，新工具无法绕过）、写操作单语句限制、无 WHERE 的 UPDATE/DELETE 强制显式确认、`CommandTimeout` 限制、连接字符串不回显。
 - **写操作审计日志**：写操作提交/演练、守卫拒绝、执行失败均落盘 `logs/audit-YYYYMMDD.log`（JSON 行、UTC 时间戳；SQL 仅存哈希与前 200 字符预览）。
-- **stdio 本地运行**：日志全部走 stderr，不污染 JSON-RPC 协议通道。
+- **stdio 本地运行 / http 远程接入**：stdio 下日志全部走 stderr，不污染 JSON-RPC 协议通道；`Transport=http` 时以 Streamable HTTP 端点 `/mcp` 常驻服务，支持远程/多客户端（ApiKey 鉴权，详见「HTTP 模式接入」）。
 
 ## 环境要求
 
@@ -234,6 +234,66 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 保存后状态显示为**绿色**即接入成功，可点击 **Try to Run** 验证。之后在对话中直接让 AI「查一下 MyDb 库有哪些表」即可。
 
 > 注意：以上路径请按实际存放位置调整——Windows 的 JSON 字符串中反斜杠需转义为 `\\`；macOS / Linux 用正斜杠且无需转义。
+
+## HTTP 模式接入（远程 / 多客户端）
+
+默认 `Transport=stdio` 由客户端**拉起进程**；改成 `Transport=http` 后，服务变为**独立常驻的 HTTP 服务**（Streamable HTTP，端点 `/mcp`），客户端改为用 URL 连接——**不再由客户端启动进程**。
+
+**1) 服务端 `appsettings.json`**
+
+```json
+{
+  "SqlServer": {
+    "Transport": "http",
+    "HttpPort": 5000,
+    "ApiKey": "换成一串足够长的随机密钥",
+    "Databases": { }
+  }
+}
+```
+
+单独启动并保持常驻（在含 `appsettings.json` 的目录下执行，否则回退到 exe 所在目录）：
+
+```bash
+dotnet run --project .          # 或运行发布产物 publish/SqlServerMcp（无扩展名，Unix 需 chmod +x）
+# 监听 http://0.0.0.0:5000 ，MCP 端点为 /mcp
+```
+
+**2) 客户端 MCP 配置**（把 stdio 的 `command/args` 换成 `url` + 鉴权头）
+
+```jsonc
+// 通用 / Claude 桌面风格 mcpServers
+{
+  "mcpServers": {
+    "sqlserver-mcp": {
+      "url": "http://127.0.0.1:5000/mcp",
+      "headers": { "Authorization": "Bearer 你的ApiKey" }
+    }
+  }
+}
+```
+
+```jsonc
+// OpenCode：type 用 http
+{
+  "mcp": {
+    "sqlserver-mcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:5000/mcp",
+      "headers": { "Authorization": "Bearer 你的ApiKey" }
+    }
+  }
+}
+```
+
+鉴权头二选一：`Authorization: Bearer <ApiKey>` 或 `X-Api-Key: <ApiKey>`（服务端均识别）。`ApiKey` 为空时对所有 `/mcp` 请求返回 401（fail-closed）。
+
+要点：
+
+- **改代码/配置后需手动重启服务进程**（客户端不再帮你重启）。
+- **运行时需 ASP.NET Core 8.0**：HTTP 产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`；本机 `dotnet run`（有 SDK）不受影响，但直接跑发布 exe 的机器需安装 ASP.NET Core 8.0 运行时（Docker 镜像已为 `aspnet:8.0`）。
+- **务必置于反向代理 + TLS 之后**，不要把带 `ApiKey` 的明文 HTTP 直接暴露到公网；`ApiKey` 用强随机值。
+- 容器化 HTTP：`docker run -p 5000:5000 -v /abs/appsettings.json:/app/appsettings.json:ro sqlserver-mcp`（去掉 `-i`，服务常驻监听端口）。
 
 ## Docker 部署（可选的隔离运行方式）
 
