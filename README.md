@@ -297,7 +297,7 @@ dotnet run --project .          # 或运行发布产物 publish/SqlServerMcp（�
 
 ### 让 http 服务常驻（不用每次手工启动）
 
-http 模式下客户端只发请求、**不拉起进程**，服务必须自己常在。`scripts/` 下提供守护脚本：
+http 模式下客户端只发请求、**不拉起进程**，服务必须自己常在。`scripts/` 下提供守护脚本（完整参数、日志格式与排障见 [`scripts/README.md`](scripts/README.md)）：
 
 ```powershell
 .\scripts\start-mcp-http.ps1 -Status      # 看端口监听 / 守护进程 / 服务进程 / 日志目录
