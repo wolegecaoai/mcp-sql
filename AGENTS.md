@@ -61,6 +61,8 @@ Dockerfile / .dockerignore    # 容器化：stdio 运行（docker run -i）；�
 docker-compose.test.yml       # 本地集成测试依赖（MySQL 8:3307 + PostgreSQL 16:5433）
 .github/workflows/ci.yml      # CI：构建 + 单元测试 + service 容器集成测试
 .github/workflows/release.yml # 发布：tag v* 触发四平台产物，打包前剔除真实配置
+scripts/                      # http 模式常驻运维：start-mcp-http.ps1（守护）+ run-guardian.cmd（无窗口启动器）
+                              #   + manage-scheduled-task.ps1（登录计划任务）+ manage-startup-shortcut.ps1（启动文件夹）
 tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例程拦截 / 方言 / 表名 / 导出 / 审计 / 自检 /
                               #   示例配置契约 / SQLite 写路径）+ IntegrationDatabase 夹具与 MySQL/PG 集成测试
 ```
@@ -96,6 +98,9 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 - **`out/` 已 gitignore**：RID 发布与 release 打包的临时目录，其中含 `appsettings.json` 副本（可能带真实凭据），禁止提交。
 - **`dotnet run` 与 `--no-build`**：本地手工测试时建议加 `--no-build`（避免构建输出污染 stdio）；作为 MCP 客户端配置时**不要**加（否则改代码后重启不会重编译）。
 - **`publish/` 是快照**：OpenCode 侧配置指向 `publish\SqlServerMcp.exe`，改代码或配置后必须重新 `dotnet publish -c Release -o publish` 才生效（CodeBuddy 侧是 `dotnet run`，重启自动编译）。
+- **http 模式要常驻，客户端不拉进程**：`Transport=http` 时 CodeBuddy 只发请求，服务必须自己常在。`scripts/start-mcp-http.ps1` 是守护脚本（`-Status`/`-Start`/`-Stop`/`-Restart`），含单实例检查（端口占用即退出）、崩溃与"进程在但端口不监听"（挂死）自动重启（15s 轮询 / 3s 重启）、日志落盘 `publish/logs/service-YYYYMMdd.log`。`scripts/run-guardian.cmd` 是无窗口启动器（`%~dp0` 自定位 + 透传参数），计划任务与启动快捷方式都由它转发。
+- **Windows 上的三个脚本坑**（改 `scripts/` 前必读）：① `.ps1` 必须带 UTF-8 BOM——Windows PowerShell 5.1 按 ANSI 读，无 BOM 的中文注释会让解析直接失败；② `Start-Process -ArgumentList` 与计划任务的 `Arguments` **不会**给带空格的路径加引号，路径会在空格处被截断（这正是"手动点 exe 无效"的根因之一），所以一律经 `.cmd` 中转；③ 被重定向的子进程按系统 ANSI/OEM 代码页（中文 Windows 936/GBK）写盘，合并进 UTF-8 日志前必须先按 GBK 读入再转码，否则日志是混合编码。
+- **计划任务可能被拒**：非管理员账户 + 组策略禁止创建计划任务时，`Register-ScheduledTask` 与 `schtasks` 都返回 `Access is denied`。此时用 `scripts/manage-startup-shortcut.ps1`（启动文件夹，无需管理员），或在管理员 PowerShell 里跑 `scripts/manage-scheduled-task.ps1 -Register`。
 
 ## 安全不变量（改动 SqlGuardService / WriteTools / Provider 前必读）
 

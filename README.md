@@ -295,6 +295,40 @@ dotnet run --project .          # 或运行发布产物 publish/SqlServerMcp（�
 - **务必置于反向代理 + TLS 之后**，不要把带 `ApiKey` 的明文 HTTP 直接暴露到公网；`ApiKey` 用强随机值。
 - 容器化 HTTP：`docker run -p 5000:5000 -v /abs/appsettings.json:/app/appsettings.json:ro sqlserver-mcp`（去掉 `-i`，服务常驻监听端口）。
 
+### 让 http 服务常驻（不用每次手工启动）
+
+http 模式下客户端只发请求、**不拉起进程**，服务必须自己常在。`scripts/` 下提供守护脚本：
+
+```powershell
+.\scripts\start-mcp-http.ps1 -Status      # 看端口监听 / 守护进程 / 服务进程 / 日志目录
+.\scripts\start-mcp-http.ps1              # 前台守护运行（Ctrl+C 停止）
+.\scripts\run-guardian.cmd                # 无窗口启动器；也可 ./scripts/run-guardian.cmd -Restart
+.\scripts\start-mcp-http.ps1 -Restart     # 改完代码/配置后重启（会先停旧实例）
+.\scripts\start-mcp-http.ps1 -Stop        # 停止守护进程与服务进程
+```
+
+守护循环提供：**单实例检查**（端口已被占用时明确退出，不抢端口）、**崩溃/挂死自动重启**（进程退出码非 0，或"进程在但端口不再监听"判定挂死并强杀，3 秒后重拉，15 秒轮询）、**日志落盘**（`publish/logs/service-YYYYMMdd.log`，生命周期事件与每次运行的 stdout/stderr 合并，便于回溯"崩过几次"）。
+
+登录自动启动（二选一）：
+
+```powershell
+# 方案 1：计划任务（可完全隐藏窗口、可配失败重试）——需要创建计划任务的权限
+.\scripts\manage-scheduled-task.ps1 -Register      # 非管理员账户可能被拒（Access denied），见下
+.\scripts\manage-scheduled-task.ps1 -Status
+.\scripts\manage-scheduled-task.ps1 -Unregister
+
+# 方案 2：启动文件夹快捷方式（无需管理员，注销即失效）
+.\scripts\manage-startup-shortcut.ps1 -Install
+.\scripts\manage-startup-shortcut.ps1 -Status
+.\scripts\manage-startup-shortcut.ps1 -Remove
+```
+
+注意：
+
+- 守护跑的是 `publish/` 快照，**改代码或 `appsettings.json` 后必须先 `dotnet publish -c Release -o publish` 再 `-Restart`**，否则跑的还是旧副本（`bin/`、`publish/` 里的 `appsettings.json` 是拷贝，双击 exe 时工作目录在 exe 目录，会读到不含 `Transport` 的旧副本而回退成 stdio）。
+- 方案 1 在非管理员账户且组策略禁止创建计划任务时会报 `Access is denied`，此时用方案 2，或在管理员 PowerShell 里重跑。
+- 方案 2 与会话绑定：注销/关机即停，重新登录后恢复；崩溃自愈只由守护脚本自身提供（没有计划任务的重试兜底）。
+
 ## Docker 部署（可选的隔离运行方式）
 
 镜像内置运行环境，真实配置**不打进镜像**（`.dockerignore` 排除 `appsettings.json`），运行时挂载：
@@ -467,6 +501,7 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 ├── .github/workflows/
 │   ├── ci.yml                   # 构建 + 单元测试 + service 容器集成测试
 │   └── release.yml              # tag 触发四平台发布（产物剔除真实配置）
+├── scripts/                     # http 模式常驻运维（守护脚本 / 无窗口启动器 / 登录自启）
 tests/
 └── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出（含输出信封）/ 只读工具契约 / 查询限额 /
                                  #              审计（含查询与保留）/ 自检 / 示例配置契约 / SQLite 写路径（333 项）
