@@ -1,6 +1,6 @@
 # AGENTS.md
 
-.NET 8 C# 项目：本地 stdio MCP Server（`ModelContextProtocol` SDK），让 AI 客户端操作已授权的多数据库。四类数据库（SQL Server / MySQL / PostgreSQL / SQLite）均支持读写，写操作带 confirm 二次确认演练；方言差异（如 MySQL DDL 隐式提交不可演练）由各 Provider 的能力标志控制。含写操作审计日志。
+.NET 10 C# 项目：本地 stdio MCP Server（`ModelContextProtocol` SDK），让 AI 客户端操作已授权的多数据库。四类数据库（SQL Server / MySQL / PostgreSQL / SQLite）均支持读写，写操作带 confirm 二次确认演练；方言差异（如 MySQL DDL 隐式提交不可演练）由各 Provider 的能力标志控制。含写操作审计日志。
 
 **语言约定**：README、代码注释、工具 Description 全部为中文，新增文档/注释保持一致。
 
@@ -57,7 +57,7 @@ Tools/
   ReadTools.cs                # 11 个只读工具（7 探查/查询 + test_connection + export_query_result + health_check + table_exists）
   WriteTools.cs               # 2 个写工具：execute_non_query / execute_ddl
   AuditTools.cs               # query_audit_log（日志目录服务端固定，不接受路径参数）
-Dockerfile / .dockerignore    # 容器化：stdio 运行（docker run -i）；运行时镜像为 aspnet:8.0（HTTP 传输需 ASP.NET Core 共享框架），配置与日志靠挂载
+Dockerfile / .dockerignore    # 容器化：stdio 运行（docker run -i）；运行时镜像为 aspnet:10.0（HTTP 传输需 ASP.NET Core 共享框架），配置与日志靠挂载
 docker-compose.test.yml       # 本地集成测试依赖（MySQL 8:3307 + PostgreSQL 16:5433）
 .github/workflows/ci.yml      # CI：构建 + 单元测试 + service 容器集成测试
 .github/workflows/release.yml # 发布：tag v* 触发四平台产物，打包前剔除真实配置
@@ -82,7 +82,7 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 ## 关键机制（易踩坑）
 
 - **stdout 是 JSON-RPC 协议通道**：任何 Console 输出/新日志都必须进 stderr（`Program.cs` 已设 `LogToStandardErrorThreshold = LogLevel.Trace`）。`dotnet run` 不加 `--no-build` 会因构建输出破坏协议。
-- **运行中的 MCP 实例会锁定构建产物**：CodeBuddy 客户端以 `dotnet run` 启动 → 锁定 `bin\Debug\net8.0\SqlServerMcp.exe`；OpenCode 指向 `publish\SqlServerMcp.exe` → 锁定 `publish\`。此时 `dotnet build` / `dotnet test` 会以 `MSB3026/MSB3027: Could not copy apphost.exe … locked by SqlServerMcp (PID)` 失败。处理：加 `-o <独立目录>`（如 `bin-test`），或先在客户端停止/重启该 MCP 服务。
+- **运行中的 MCP 实例会锁定构建产物**：CodeBuddy 客户端以 `dotnet run` 启动 → 锁定 `bin\Debug\net10.0\SqlServerMcp.exe`；OpenCode 指向 `publish\SqlServerMcp.exe` → 锁定 `publish\`。此时 `dotnet build` / `dotnet test` 会以 `MSB3026/MSB3027: Could not copy apphost.exe … locked by SqlServerMcp (PID)` 失败。处理：加 `-o <独立目录>`（如 `bin-test`），或先在客户端停止/重启该 MCP 服务。
 - **配置加载顺序**（`Program.cs` `ResolveConfigDirectory`）：优先 CWD 的 `appsettings.json`，但仅当其含 `"SqlServer"` 节才采用，否则回退到 `AppContext.BaseDirectory` 的副本。环境变量覆盖用双下划线：`SqlServer__Databases__<别名>__ConnectionString`。配置源在 `Sources.Clear()` 后只重建为 JsonFile + 环境变量——**命令行配置源是被刻意移除的**（曾导致同名配置源歧义），不要"顺手加回"。启动日志首行会打印实际生效的配置目录，改配置不生效时先看它。
 - **`appsettings.json` 已被 `.gitignore` 排除**（含真实连接密码），`bin/`、`publish/` 中的副本同样含密码。**不要**提交它，也不要用模板覆盖用户现有配置。其中 `OnlineQuotationSystem` 的库名连接串里含零宽字符 U+200C，是刻意保留的（真实库名如此），编辑时勿"清理"。
 - **`nuget.config` 必须保留**：`<clear />` 锁定 nuget.org，因为本机全局 NuGet 配置存在不可达源会导致还原失败。
@@ -94,7 +94,7 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 - **测试默认排除集成测试**：测试 csproj 里设了 `<VSTestTestCaseFilter>Category!=Integration</VSTestTestCaseFilter>`，因此裸 `dotnet test` 永远零依赖可跑；CI 的集成 job 用显式 `--filter "Category=Integration"` **覆盖**该默认值（已验证覆盖生效）。改这个属性时务必确认两个方向都对。
 - **启动自检只告警不阻断**：`StartupDiagnostics.RunAsync` 在 `host.RunAsync()` 之前执行，配置问题只输出 stderr 警告。**不要**把它改成"有问题就退出"——stdio 服务启动即退出会让客户端侧完全拿不到诊断信息。配置文件的 `AddJsonFile` 是 `optional: true`，缺失时同样走警告路径而不是抛异常。
 - **传输方式 stdio / http 双路径**：`SqlServer:Transport`（stdio 默认 / http）决定启动 stdio（Generic Host，stdout 是协议通道）还是 http（`WebApplication` + `WithHttpTransport` + `MapMcp("/mcp")`）。http 模式唯一鉴权闸是 `HttpApiKeyAuth` 中间件——**仅保护 `/mcp`、未配置 `ApiKey` 一律 401（fail-closed）**；`Transport` 无法识别时 `ResolveTransport` 输出 stderr 告警并回退 stdio。**新增传输/中间件不得削弱该 fail-closed。**
-- **运行时需 ASP.NET Core 8.0**：自支持 http 传输起，产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`（`ModelContextProtocol.AspNetCore` + `<FrameworkReference Microsoft.AspNetCore.App />`）。Dockerfile 运行时镜像已用 `aspnet:8.0`；framework-dependent 发布物要求目标机装有 **.NET ASP.NET Core 8.0 运行时**（仅装 .NET 运行时会启动失败）。
+- **运行时需 ASP.NET Core 10.0**：自支持 http 传输起，产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`（`ModelContextProtocol.AspNetCore` + `<FrameworkReference Microsoft.AspNetCore.App />`）。Dockerfile 运行时镜像已用 `aspnet:10.0`；framework-dependent 发布物要求目标机装有 **.NET ASP.NET Core 10.0 运行时**（仅装 .NET 运行时会启动失败）。
 - **`out/` 已 gitignore**：RID 发布与 release 打包的临时目录，其中含 `appsettings.json` 副本（可能带真实凭据），禁止提交。
 - **`dotnet run` 与 `--no-build`**：本地手工测试时建议加 `--no-build`（避免构建输出污染 stdio）；作为 MCP 客户端配置时**不要**加（否则改代码后重启不会重编译）。
 - **`publish/` 是快照**：OpenCode 侧配置指向 `publish\SqlServerMcp.exe`，改代码或配置后必须重新 `dotnet publish -c Release -o publish` 才生效（CodeBuddy 侧是 `dotnet run`，重启自动编译）。

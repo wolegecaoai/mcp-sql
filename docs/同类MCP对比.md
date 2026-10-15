@@ -1,6 +1,6 @@
 # 同类数据库 MCP Server 对比分析
 
-> 本文档对 GitHub 上主流的「数据库类 MCP Server」做客观对比，提炼**本项目（.NET 8 本地多库 MCP Server）**相对同类的优点，并给出可借鉴点与落地建议。
+> 本文档对 GitHub 上主流的「数据库类 MCP Server」做客观对比，提炼**本项目（.NET 10 本地多库 MCP Server）**相对同类的优点，并给出可借鉴点与落地建议。
 > 全文中文；仓库名 / 技术名保留英文原词。对比数据来源于各仓库 README（抓取于 2026-10），如官方后续调整以仓库现行文档为准。
 > 本文为纯分析文档，**不改动任何源码、配置或测试**。
 
@@ -14,7 +14,7 @@
 
 | 对象 | 类型 | 说明 |
 |---|---|---|
-| **本项目**（`.NET 8 MCP`） | 多库 all-in-one（本地） | 被对比方，SQL Server/MySQL/PostgreSQL/SQLite，读写 + 演练确认 |
+| **本项目**（`.NET 10 MCP`） | 多库 all-in-one（本地） | 被对比方，SQL Server/MySQL/PostgreSQL/SQLite，读写 + 演练确认 |
 | 官方参考实现 `modelcontextprotocol/server-postgres` `-mysql` `-sqlite` | 单库参考实现（已归档） | Anthropic 维护，TypeScript，以只读为主 |
 | `apisql-dev/apisql-mcp` | 多库 all-in-one（远程/本地） | TypeScript/Node，15+ 数据库，完整 DDL/DML，平台网关鉴权 |
 | `ttcc666/DatabaseMcpServer` | 多库 all-in-one（本地） | **C#/.NET 9**，19 种库含国产信创，约 55 个工具 |
@@ -28,9 +28,9 @@
 
 ## 2. 横向对比矩阵
 
-| 维度 | 本项目（.NET 8 MCP） | 官方参考 `server-*` | `apisql-mcp` | `ttcc666/DatabaseMcpServer` | `chenlinyang/mcp-server-mysql` |
+| 维度 | 本项目（.NET 10 MCP） | 官方参考 `server-*` | `apisql-mcp` | `ttcc666/DatabaseMcpServer` | `chenlinyang/mcp-server-mysql` |
 |---|---|---|---|---|---|
-| 实现语言/运行时 | C# / .NET 8 | TypeScript / Node | TypeScript / Node | **C# / .NET 9** | TypeScript / Node |
+| 实现语言/运行时 | C# / .NET 10 | TypeScript / Node | TypeScript / Node | **C# / .NET 9** | TypeScript / Node |
 | 传输方式 | stdio | stdio | **stdio + Streamable HTTP** | stdio（另带 `-web` 本地控制台） | stdio |
 | 支持数据库 | 4 种（SQL Server/MySQL/PostgreSQL/SQLite） | 单库（pg/mysql/sqlite 各一） | **15+**（含 Oracle/TiDB/StarRocks/Doris/DuckDB/OceanBase/达梦/Trino 等） | **19 种**（含达梦/Kingbase/GaussDB/PolarDB/Vastbase 等信创） | 仅 MySQL |
 | 工具数量 | 12（9 只读 + 2 写 + 1 审计） | 1（`query`）+ schema 资源 | 1（`execute_sql`） | **约 55** | 少量（探查 + 查询 + 分析） |

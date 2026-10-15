@@ -1,6 +1,6 @@
 # SqlServerMcp — 本地多数据库 MCP Server
 
-基于 .NET 8 + [ModelContextProtocol C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) 的本地 MCP 服务器，让 AI（CodeBuddy 等 MCP 客户端）能够连接并操作本机**已授权**的多个数据库（SQL Server / MySQL / PostgreSQL / SQLite）：结构探查、只读查询，以及带二次确认机制的完整 CRUD/DDL 写操作（四类数据库均支持）。
+基于 .NET 10 + [ModelContextProtocol C# SDK](https://github.com/modelcontextprotocol/csharp-sdk) 的本地 MCP 服务器，让 AI（CodeBuddy 等 MCP 客户端）能够连接并操作本机**已授权**的多个数据库（SQL Server / MySQL / PostgreSQL / SQLite）：结构探查、只读查询，以及带二次确认机制的完整 CRUD/DDL 写操作（四类数据库均支持）。
 
 ## 功能特性
 
@@ -15,7 +15,7 @@
 
 ## 环境要求
 
-- .NET 8 SDK（或更高版本）
+- .NET 10 SDK（或更高版本）
 - 可访问的数据库实例（按需）：SQL Server（Windows 下可为 LocalDB / SQLEXPRESS / 默认实例；macOS / Linux 无本地实例，需连远程或 Docker）、MySQL、PostgreSQL、SQLite（文件型无需服务）
 
 ## 快速开始
@@ -225,7 +225,7 @@ chmod +x publish/SqlServerMcp        # 首次需赋予执行权限（Unix 可执
 
 | 事项 | 说明 |
 | --- | --- |
-| 安装 .NET | 需自行安装 .NET 8 SDK（[官网安装包](https://dotnet.microsoft.com/download) 或 `brew install --cask dotnet-sdk`）；`dotnet --version` 可确认 |
+| 安装 .NET | 需自行安装 .NET 10 SDK（[官网安装包](https://dotnet.microsoft.com/download) 或 `brew install --cask dotnet-sdk`）；`dotnet --version` 可确认 |
 | 客户端找不到 `dotnet` | GUI 启动的客户端可能不继承 shell 的 PATH。把 `command` 写成绝对路径：Apple Silicon 常用 `/opt/homebrew/bin/dotnet`，Intel 包安装通常为 `/usr/local/share/dotnet/dotnet`（用 `which dotnet` 查） |
 | SQL Server 目标 | macOS 上**没有本地 SQL Server**：`Type: sqlserver` 的条目请指向远程实例或 Docker 容器（`mcr.microsoft.com/mssql/server`）；MySQL / PostgreSQL / SQLite 均可原生连接（SQLite 为文件路径，如 `Data Source=/Users/你的用户名/data/app.db;`） |
 | 路径中的空格与中文 | `/Users/.../MCP 数据库/...` 这类路径直接写即可，无需加引号或转义 |
@@ -291,7 +291,7 @@ dotnet run --project .          # 或运行发布产物 publish/SqlServerMcp（�
 要点：
 
 - **改代码/配置后需手动重启服务进程**（客户端不再帮你重启）。
-- **运行时需 ASP.NET Core 8.0**：HTTP 产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`；本机 `dotnet run`（有 SDK）不受影响，但直接跑发布 exe 的机器需安装 ASP.NET Core 8.0 运行时（Docker 镜像已为 `aspnet:8.0`）。
+- **运行时需 ASP.NET Core 10.0**：HTTP 产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`；本机 `dotnet run`（有 SDK）不受影响，但直接跑发布 exe 的机器需安装 ASP.NET Core 10.0 运行时（Docker 镜像已为 `aspnet:10.0`）。
 - **务必置于反向代理 + TLS 之后**，不要把带 `ApiKey` 的明文 HTTP 直接暴露到公网；`ApiKey` 用强随机值。
 - 容器化 HTTP：`docker run -p 5000:5000 -v /abs/appsettings.json:/app/appsettings.json:ro sqlserver-mcp`（去掉 `-i`，服务常驻监听端口）。
 
