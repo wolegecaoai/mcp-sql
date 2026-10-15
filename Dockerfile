@@ -26,6 +26,7 @@ COPY Configuration/ Configuration/
 COPY Services/ Services/
 COPY Tools/ Tools/
 COPY appsettings.example.json ./
+COPY wwwroot/ wwwroot/
 
 RUN dotnet publish SqlServerMcp.csproj -c Release -o /app/publish --no-restore
 

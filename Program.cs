@@ -69,8 +69,17 @@ static async Task RunHttpAsync(string[] args, string configDirectory)
         await next();
     });
 
+    // 运维看板：静态资源（wwwroot/dashboard）与只读 JSON API。
+    // 顺序要求：静态文件中间件必须在鉴权中间件之后、MapMcp 之前。
+    // 注意：静态文件中间件对**所有**路径生效，因此 wwwroot 下不得出现名为 "mcp" 的文件或目录，
+    // 否则会短路 MCP 端点（wwwroot 内只放 dashboard/ 子目录即可规避）。
+    app.UseDefaultFiles();
+    app.UseStaticFiles();
+
     await app.Services.GetRequiredService<StartupDiagnostics>().RunAsync();
     app.MapMcp("/mcp");
+    app.MapGet("/", () => Results.Redirect($"{DashboardEndpoints.BasePath}/"));
+    DashboardEndpoints.Map(app);
     await app.RunAsync();
 }
 
@@ -105,6 +114,25 @@ static void ConfigureServices(IServiceCollection services, string configDirector
         serviceProvider.GetRequiredService<AuditLogger>(),
         configDirectory,
         serviceProvider.GetRequiredService<ILogger<StartupDiagnostics>>()));
+
+    if (string.Equals(transport, "http", StringComparison.OrdinalIgnoreCase))
+    {
+        // 看板连通性探测缓存：仅 http 模式有 Web 宿主，stdio 模式不注册也不实例化。
+        // 探测委托直接复用 GetAllServerInfoAsync（并行、单库 5 秒超时、单库失败隔离）。
+        services.AddSingleton(serviceProvider =>
+        {
+            var databaseService = serviceProvider.GetRequiredService<DatabaseService>();
+            return new DashboardProbeCache(
+                async (timeoutSeconds, ct) =>
+                {
+                    var results = await databaseService.GetAllServerInfoAsync(timeoutSeconds, ct);
+                    return results
+                        .Select(item => new DatabaseProbeResult(item.Database, item.Info, item.Error))
+                        .ToList();
+                },
+                serviceProvider.GetRequiredService<ILogger<DashboardProbeCache>>());
+        });
+    }
 
     var mcp = services
         .AddMcpServer()

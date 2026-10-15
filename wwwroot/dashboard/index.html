@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>数据库运维看板 · SqlServerMcp</title>
+<meta name="description" content="SqlServerMcp 只读运维看板：授权数据库连通性、审计统计与最近写操作记录。">
+<meta name="color-scheme" content="dark">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="dashboard.css">
+</head>
+<body>
+
+<!-- 顶部工具条：服务状态 + 最后更新时间 + 自动刷新开关 + 手动刷新 -->
+<header class="topbar">
+  <div class="brand">
+    <span class="brand__mark" aria-hidden="true"></span>
+    <div class="brand__text">
+      <h1>数据库运维看板</h1>
+      <p>SqlServerMcp · 只读视图</p>
+    </div>
+  </div>
+
+  <div class="topbar__chips" id="topbar-chips" aria-label="服务状态">
+    <span class="chip chip--muted" id="chip-transport">传输 —</span>
+    <span class="chip chip--muted" id="chip-write">写操作 —</span>
+    <span class="chip chip--muted" id="chip-apikey">/mcp 鉴权 —</span>
+  </div>
+
+  <div class="topbar__actions">
+    <span class="updated" id="updated-at" aria-live="polite">尚未加载</span>
+    <label class="switch" for="auto-refresh">
+      <input type="checkbox" id="auto-refresh" checked>
+      <span class="switch__track" aria-hidden="true"><span class="switch__thumb"></span></span>
+      <span class="switch__label">自动刷新</span>
+    </label>
+    <button class="btn" id="refresh-btn" type="button">
+      <svg class="btn__icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+        <path d="M13.6 8a5.6 5.6 0 1 1-1.7-4l1.2-1.2v4h-4l1.3-1.3A4 4 0 1 0 12 8h1.6z"/>
+      </svg>
+      刷新
+    </button>
+  </div>
+
+  <div class="progress" id="progress" aria-hidden="true"></div>
+</header>
+
+<main class="page">
+
+  <!-- 区块 1：概览指标卡 -->
+  <section class="section" aria-labelledby="kpi-heading">
+    <h2 class="section__title" id="kpi-heading">概览</h2>
+    <div class="kpi-grid" id="kpi-grid">
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+      <div class="kpi skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span></div>
+    </div>
+  </section>
+
+  <!-- 区块 2：数据库健康矩阵 -->
+  <section class="section" aria-labelledby="db-heading">
+    <h2 class="section__title" id="db-heading">
+      数据库健康
+      <span class="section__note" id="db-note"></span>
+    </h2>
+    <div class="db-grid" id="db-grid">
+      <div class="db-card skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span><span class="skeleton skeleton--line"></span></div>
+      <div class="db-card skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span><span class="skeleton skeleton--line"></span></div>
+      <div class="db-card skeleton-block"><span class="skeleton skeleton--line"></span><span class="skeleton skeleton--value"></span><span class="skeleton skeleton--line"></span></div>
+    </div>
+  </section>
+
+  <!-- 区块 3：审计统计图表 -->
+  <section class="section" aria-labelledby="audit-heading">
+    <h2 class="section__title" id="audit-heading">
+      审计统计
+      <span class="section__note" id="audit-note">UTC 存储，本地时区展示</span>
+    </h2>
+
+    <div class="chart-grid">
+      <article class="panel">
+        <h3 class="panel__title">事件类型分布</h3>
+        <div class="donut" id="donut-events">
+          <div class="skeleton skeleton--donut"></div>
+        </div>
+        <ul class="legend" id="legend-events"></ul>
+      </article>
+
+      <article class="panel">
+        <h3 class="panel__title">写操作模式</h3>
+        <div class="donut" id="donut-modes">
+          <div class="skeleton skeleton--donut"></div>
+        </div>
+        <ul class="legend" id="legend-modes"></ul>
+      </article>
+
+      <article class="panel panel--wide">
+        <h3 class="panel__title">逐日趋势</h3>
+        <div class="bars" id="bars-trend">
+          <div class="skeleton skeleton--bars"></div>
+        </div>
+      </article>
+    </div>
+
+    <article class="panel panel--full">
+      <h3 class="panel__title">按数据库分布</h3>
+      <ul class="dist" id="dist-database"><li class="empty empty--inline">加载中…</li></ul>
+    </article>
+  </section>
+
+  <!-- 区块 4：最近写操作记录 -->
+  <section class="section" aria-labelledby="recent-heading">
+    <h2 class="section__title" id="recent-heading">
+      最近审计记录
+      <span class="section__note" id="recent-note"></span>
+    </h2>
+    <div class="table-wrap">
+      <table class="entries">
+        <caption class="visually-hidden">最近审计记录（时间、数据库、工具、模式、影响行数、摘要）</caption>
+        <thead>
+          <tr>
+            <th scope="col">时间</th>
+            <th scope="col">事件</th>
+            <th scope="col">数据库</th>
+            <th scope="col">工具</th>
+            <th scope="col">模式</th>
+            <th scope="col" class="num">影响行数</th>
+            <th scope="col">摘要</th>
+          </tr>
+        </thead>
+        <tbody id="recent-body">
+          <tr><td colspan="7" class="empty">加载中…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+</main>
+
+<!-- 区块 5：页脚配置摘要（脱敏） -->
+<footer class="footer">
+  <div class="footer__row" id="footer-config">
+    <span class="footer__item">配置加载中…</span>
+  </div>
+  <p class="footer__note">
+    本页只读，不提供任何执行 SQL 或修改数据的入口；页面未鉴权，仅应在受信任的本机 / 内网环境访问。
+  </p>
+</footer>
+
+<!-- 全局错误提示条（含重试） -->
+<div class="toast" id="toast" role="status" aria-live="assertive" hidden>
+  <div class="toast__body">
+    <strong class="toast__title" id="toast-title">加载失败</strong>
+    <p class="toast__text" id="toast-text"></p>
+  </div>
+  <button class="btn btn--ghost" id="toast-retry" type="button">重试</button>
+</div>
+
+<script src="dashboard.js"></script>
+</body>
+</html>

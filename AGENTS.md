@@ -10,7 +10,7 @@
 dotnet build                              # 构建（无 .sln，根目录直接构建主项目）
 dotnet build -o bin-test                  # 构建到独立目录；被运行中实例锁住 bin/ 时用这个
 dotnet run --no-build                     # 运行；必须加 --no-build，避免构建输出污染 stdio 通道
-dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（361 项；集成测试被默认过滤器排除，见下）
+dotnet test tests/SqlServerMcp.Tests      # 跑全部无依赖测试（389 项；集成测试被默认过滤器排除，见下）
 dotnet publish -c Release -o publish      # 发布快照；publish/ 不是热更新，改代码/配置后必须重新 publish
 ```
 
@@ -52,6 +52,9 @@ Services/
   StartupDiagnostics.cs       # 启动自检：配置校验（纯函数）+ 可选连通性预检，只告警不阻断
   SecretRedactor.cs           # 连接串密码脱敏（Password/Pwd/Passwd），用于面向调用方的错误文案
   HttpApiKeyAuth.cs           # http 传输鉴权判定（仅保护 /mcp，空 ApiKey fail-closed，定长时间比较）
+  DashboardAuditSummary.cs    # 看板审计统计纯函数（事件/模式计数、逐日趋势、按库按工具分布），无 I/O
+  DashboardProbeCache.cs      # 看板连通性探测 TTL 缓存（10 秒；并发合并；探测委托 DatabaseProbeHandler 可注入以便单测）
+  DashboardEndpoints.cs       # 看板只读 JSON 端点（/dashboard/api/*；入参仅数值 Clamp；配置摘要逐字段脱敏）
   Providers/*.cs              # 四种数据库方言实现（唯一生成方言 SQL 的地方）
 Tools/
   ReadTools.cs                # 11 个只读工具（7 探查/查询 + test_connection + export_query_result + health_check + table_exists）
@@ -63,8 +66,10 @@ docker-compose.test.yml       # 本地集成测试依赖（MySQL 8:3307 + Postgr
 .github/workflows/release.yml # 发布：tag v* 触发四平台产物，打包前剔除真实配置
 scripts/                      # http 模式常驻运维：start-mcp-http.ps1（守护）+ run-guardian.cmd（无窗口启动器）
                               #   + manage-scheduled-task.ps1（登录计划任务）+ manage-startup-shortcut.ps1（启动文件夹）
+wwwroot/dashboard/            # 运维看板前端（零依赖原生 HTML/CSS/JS，无 CDN/npm/构建；随发布产物分发）
 tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例程拦截 / 方言 / 表名 / 导出 / 审计 / 自检 /
-                              #   示例配置契约 / SQLite 写路径）+ IntegrationDatabase 夹具与 MySQL/PG 集成测试
+                              #   示例配置契约 / 看板审计统计与探测缓存 / SQLite 写路径）+ IntegrationDatabase 夹具
+                              #   + MySQL/PG 集成测试（389 项，集成测试默认排除）
 ```
 
 **分层契约**：Tools 只负责参数校验、审计埋点与中文文案；**所有方言 SQL（目录查询、版本探测、标识符转义/切割）由 Provider 生成**，`DatabaseService` 从不拼方言 SQL。新增方言只需加 Provider，不动服务层与工具层（`ProviderTests` 断言目录查询的列别名契约）。
@@ -94,6 +99,8 @@ tests/SqlServerMcp.Tests/     # xUnit 表驱动测试（守卫 / 写守卫 / 例
 - **测试默认排除集成测试**：测试 csproj 里设了 `<VSTestTestCaseFilter>Category!=Integration</VSTestTestCaseFilter>`，因此裸 `dotnet test` 永远零依赖可跑；CI 的集成 job 用显式 `--filter "Category=Integration"` **覆盖**该默认值（已验证覆盖生效）。改这个属性时务必确认两个方向都对。
 - **启动自检只告警不阻断**：`StartupDiagnostics.RunAsync` 在 `host.RunAsync()` 之前执行，配置问题只输出 stderr 警告。**不要**把它改成"有问题就退出"——stdio 服务启动即退出会让客户端侧完全拿不到诊断信息。配置文件的 `AddJsonFile` 是 `optional: true`，缺失时同样走警告路径而不是抛异常。
 - **传输方式 stdio / http 双路径**：`SqlServer:Transport`（stdio 默认 / http）决定启动 stdio（Generic Host，stdout 是协议通道）还是 http（`WebApplication` + `WithHttpTransport` + `MapMcp("/mcp")`）。http 模式唯一鉴权闸是 `HttpApiKeyAuth` 中间件——**仅保护 `/mcp`、未配置 `ApiKey` 一律 401（fail-closed）**；`Transport` 无法识别时 `ResolveTransport` 输出 stderr 告警并回退 stdio。**新增传输/中间件不得削弱该 fail-closed。**
+- **运维看板只在 http 模式存在**：`DashboardEndpoints.Map` 与 `UseDefaultFiles/UseStaticFiles` 都挂在 `RunHttpAsync` 分支内，顺序必须是「鉴权中间件 → 静态文件 → `MapMcp`」。静态文件中间件对**所有**路径生效，因此 `wwwroot` 下**绝不能**出现名为 `mcp` 的文件或目录，否则会短路 MCP 端点（当前 `wwwroot` 内只有 `dashboard/`，安全）。看板端点全为只读 GET，入参仅 `days`/`limit` 且都 Clamp，**不接受 SQL/表名/路径**；配置摘要逐字段构造，**绝不**序列化 `SqlServerOptions`（否则会把 ApiKey 与连接串泄漏到页面）。看板与 API **无鉴权**（鉴权中间件只保护 `/mcp`）——这是刻意的产品决策，只应部署在受信本机/内网；**不要让该决策外溢到 `/mcp`**。
+- **`wwwroot` 必须两处同步声明**：主项目用 `Microsoft.NET.Sdk`（非 Web SDK），`wwwroot` 不会被自动识别为静态资源目录，必须在 csproj 里显式 `<Content Include="wwwroot\**\*">`；`Dockerfile` 是白名单式 COPY，也需 `COPY wwwroot/ wwwroot/`。任一处遗漏都会让 `/dashboard/` 在发布产物或容器中 404。
 - **运行时需 ASP.NET Core 10.0**：自支持 http 传输起，产物同时依赖 `Microsoft.NETCore.App` 与 `Microsoft.AspNetCore.App`（`ModelContextProtocol.AspNetCore` + `<FrameworkReference Microsoft.AspNetCore.App />`）。Dockerfile 运行时镜像已用 `aspnet:10.0`；framework-dependent 发布物要求目标机装有 **.NET ASP.NET Core 10.0 运行时**（仅装 .NET 运行时会启动失败）。
 - **`out/` 已 gitignore**：RID 发布与 release 打包的临时目录，其中含 `appsettings.json` 副本（可能带真实凭据），禁止提交。
 - **`dotnet run` 与 `--no-build`**：本地手工测试时建议加 `--no-build`（避免构建输出污染 stdio）；作为 MCP 客户端配置时**不要**加（否则改代码后重启不会重编译）。

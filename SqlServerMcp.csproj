@@ -37,6 +37,13 @@
     <Content Include="appsettings.example.json">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
+
+    <!-- 运维看板的静态资源（wwwroot/dashboard）。本项目用的是 Microsoft.NET.Sdk 而非 Web SDK，
+         wwwroot **不会**被自动识别为静态资源目录，必须显式声明才会复制到输出与发布产物；
+         遗漏此项会导致 http 模式下 /dashboard/ 返回 404（容器内同理，Dockerfile 亦为白名单 COPY） -->
+    <Content Include="wwwroot\**\*">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
   </ItemGroup>
 
   <!-- 测试项目位于 tests/ 子目录，排除出主程序集编译 -->

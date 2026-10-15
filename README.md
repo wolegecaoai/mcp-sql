@@ -12,6 +12,7 @@
 - **安全防护**：危险关键词黑名单（`DROP DATABASE`、`CREATE LOGIN`、`GRANT` 等实例级与提权语句，以及各数据库方言的例程/触发器/程序集创建语句，可配置）、`execute_query` 只读加固（穿透 CTE 识别主语句类型，拦截 `WITH ... INSERT/UPDATE/DELETE` 与 `SELECT ... INTO`）、守卫下沉到服务层（查询/写入的唯一入口内置校验，新工具无法绕过）、写操作单语句限制、无 WHERE 的 UPDATE/DELETE 强制显式确认、`CommandTimeout` 限制、连接字符串不回显。
 - **写操作审计日志**：写操作提交/演练、守卫拒绝、执行失败均落盘 `logs/audit-YYYYMMDD.log`（JSON 行、UTC 时间戳；SQL 仅存哈希与前 200 字符预览）。
 - **stdio 本地运行 / http 远程接入**：stdio 下日志全部走 stderr，不污染 JSON-RPC 协议通道；`Transport=http` 时以 Streamable HTTP 端点 `/mcp` 常驻服务，支持远程/多客户端（ApiKey 鉴权，详见「HTTP 模式接入」）。
+- **运维看板（http 模式）**：只读的单页运维控制台，一屏呈现授权库连通性/版本、审计统计（写操作提交 vs 演练、守卫拒绝）与最近记录；零依赖前端随服务托管在 `/dashboard`（详见「运维看板」章节）。
 
 ## 环境要求
 
@@ -329,6 +330,27 @@ http 模式下客户端只发请求、**不拉起进程**，服务必须自己�
 - 方案 1 在非管理员账户且组策略禁止创建计划任务时会报 `Access is denied`，此时用方案 2，或在管理员 PowerShell 里重跑。
 - 方案 2 与会话绑定：注销/关机即停，重新登录后恢复；崩溃自愈只由守护脚本自身提供（没有计划任务的重试兜底）。
 
+## 运维看板（http 模式）
+
+`Transport=http` 时服务会额外托管一个**只读**运维看板，用于日常巡检与事后回溯：授权库的连通性与版本、审计统计（写操作提交 vs 演练、守卫拒绝、执行失败）、最近若干条审计记录，以及脱敏后的配置摘要。
+
+```text
+http://localhost:5000/dashboard/                          # 看板页面（访问根路径 / 会自动跳转到这里）
+http://localhost:5000/dashboard/api/overview              # 概览：脱敏配置 + 库清单 + 连通性探测
+http://localhost:5000/dashboard/api/audit/summary?days=7  # 审计统计（days 默认 7，Clamp 1–30）
+http://localhost:5000/dashboard/api/audit/recent?limit=50 # 最近审计记录（limit 默认 50，Clamp 1–200）
+```
+
+要点：
+
+- **只在 http 模式可用**：stdio 模式只跑 Generic Host，没有 Web 宿主，不存在任何 HTTP 端点。
+- **页面与 API 均无鉴权**：鉴权中间件只保护 `/mcp`，看板在非 `/mcp` 路径上对任何能访问该端口的人开放。**务必只在受信任的本机 / 内网使用**，不要把端口直接暴露到公网；需要远程访问时请置于反向代理 + TLS 与额外鉴权之后。
+- **只读**：三个端点不接受 SQL、表名或路径参数（唯一入参是数值型 `days` / `limit`，且都做 Clamp），页面上没有任何执行 SQL 或修改数据的入口。
+- **配置摘要已脱敏**：逐字段输出传输方式、端口、写开关、命令超时、审计保留天数、危险关键词条数等；`ApiKey` 与连接串**绝不**出现在页面或 API 响应里（`ApiKey` 仅以「是否已配置」的布尔值体现）。
+- **连通性探测有 10 秒 TTL 缓存**：页面轮询不会造成对每个库的反复建连，多标签页共享同一次探测；探测本身并行执行、单库最长 5 秒、单库失败只影响该卡片。
+- **时间口径**：审计时间戳按 UTC 存储与切日，页面展示时转换为浏览器本地时区，并在表格内保留 UTC 原值。
+- **前端零依赖**：原生 HTML/CSS/JS，不使用任何 CDN、npm 或构建步骤（纯内网/离线可用），源码位于 `wwwroot/dashboard/`，随发布产物一起分发。
+
 ## Docker 部署（可选的隔离运行方式）
 
 镜像内置运行环境，真实配置**不打进镜像**（`.dockerignore` 排除 `appsettings.json`），运行时挂载：
@@ -487,6 +509,9 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 │   ├── HttpApiKeyAuth.cs          # http 传输鉴权判定（仅 /mcp、空 ApiKey fail-closed）
 │   ├── AuditLogger.cs             # 审计日志：写入、查询、保留清理
 │   ├── StartupDiagnostics.cs      # 启动自检：配置校验 + 可选连通性预检（只告警不阻断）
+│   ├── DashboardAuditSummary.cs   # 看板审计统计纯函数（事件/模式计数、逐日趋势、按库按工具分布）
+│   ├── DashboardProbeCache.cs     # 看板连通性探测的 TTL 缓存（10 秒，并发合并，探测委托可注入）
+│   ├── DashboardEndpoints.cs      # 看板只读 JSON 端点（/dashboard/api/*，入参仅数值 Clamp，配置摘要脱敏）
 │   └── Providers/
 │       ├── SqlServerProvider.cs   # SQL Server（sys.* 目录）
 │       ├── MySqlProvider.cs       # MySQL（information_schema，DDL 不可事务化）
@@ -496,6 +521,7 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 │   ├── ReadTools.cs             # 11 个只读工具（含 test_connection / export_query_result / health_check / table_exists）
 │   ├── WriteTools.cs            # 2 个写工具（confirm 二次确认）
 │   └── AuditTools.cs            # query_audit_log（审计日志查询，不接受路径参数）
+├── wwwroot/dashboard/           # 运维看板前端（零依赖原生 HTML/CSS/JS，随发布产物分发）
 ├── Dockerfile / .dockerignore   # 容器化（stdio 运行，配置与日志走挂载）
 ├── docker-compose.test.yml      # 集成测试依赖（MySQL 8 + PostgreSQL 16）
 ├── .github/workflows/
@@ -504,8 +530,8 @@ dotnet test tests/SqlServerMcp.Tests --filter "Category=Integration"
 ├── scripts/                     # http 模式常驻运维（守护脚本 / 无窗口启动器 / 登录自启）
 tests/
 └── SqlServerMcp.Tests/          # xUnit 测试：守卫 / 方言 / 导出（含输出信封）/ 只读工具契约 / 查询限额 /
-                                 #              审计（含查询与保留）/ 自检 / 示例配置契约 / SQLite 写路径（333 项）
-                                 #              + MySQL/PG 集成测试（默认排除）
+                                 #              审计（含查询与保留）/ 自检 / 示例配置契约 / 看板统计与探测缓存 /
+                                 #              SQLite 写路径 + MySQL/PG 集成测试（默认排除）（389 项）
 logs/                            # 运行时生成的审计日志（已 gitignore）
 ```
 
